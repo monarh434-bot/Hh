@@ -1269,7 +1269,7 @@ def render_admin_settings() -> str:
     )
 
 def render_operator_modes() -> str:
-    lines = []
+    lines = [f"📥 <b>Общий приём номеров:</b> {'✅ Включен' if is_numbers_enabled() else '🚫 Выключен'}", ""]
     for key in OPERATORS:
         hold_status = "✅" if is_operator_mode_enabled(key, "hold") else "🚫"
         nh_status = "✅" if is_operator_mode_enabled(key, "no_hold") else "🚫"
@@ -1677,8 +1677,8 @@ def resolve_user_input(raw: str):
         if user:
             return user
         user = db.conn.execute(
-            "SELECT * FROM users WHERE lower(username) LIKE ? ORDER BY user_id DESC LIMIT 1",
-            (username_candidate.lower(),),
+            "SELECT * FROM users WHERE lower(username)=? OR lower(username) LIKE ? ORDER BY user_id DESC LIMIT 1",
+            (username_candidate.lower(), f"%{username_candidate.lower()}%"),
         ).fetchone()
         if user:
             return user
@@ -2274,7 +2274,7 @@ async def admin_operator_modes(callback: CallbackQuery):
 async def admin_toggle_avail(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, mode, operator_key = callback.data.split(":")
+    _, _, mode, operator_key = callback.data.split(":")
     set_operator_mode_enabled(operator_key, mode, not is_operator_mode_enabled(operator_key, mode))
     await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
     await callback.answer("Статус обновлён")
@@ -3121,10 +3121,20 @@ async def slip_cb(callback: CallbackQuery):
 async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    action = callback.data.split(":")[-1]
+    raw_action = callback.data.split(":")[-1]
+    action_map = {
+        "user_stats": "stats",
+        "user_set_price": "set_price",
+        "user_pm": "pm",
+        "user_add_balance": "add_balance",
+        "user_sub_balance": "sub_balance",
+        "user_ban": "ban",
+        "user_unban": "unban",
+    }
+    action = action_map.get(raw_action, raw_action)
     await state.update_data(user_action=action)
     await state.set_state(AdminStates.waiting_user_action_id)
-    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>\n\n<i>Примеры:</i> <code>626387429</code> или <code>@tyyttooo</code>")
+    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>")
     await callback.answer()
 
 @router.message(AdminStates.waiting_user_action_id)
@@ -3191,7 +3201,8 @@ async def admin_user_action_id(message: Message, state: FSMContext):
             f"👤 <b>{escape(user['full_name'] or '')}</b>\n"
             f"🆔 <code>{target_user_id}</code>\n"
             f"🔗 @{escape(user['username']) if user['username'] else '—'}\n\n"
-            "<b>Введите персональный прайс</b>\n\n"
+            "<b>Введите персональный прайс</b>\n"
+            "<i>Формат без ID пользователя, только:</i> <code>оператор режим цена</code>\n\n"
             "<b>Текущие персональные прайсы:</b>\n"
             f"{current}\n\n"
             "Формат: <code>оператор режим цена</code>\n"
@@ -3348,7 +3359,114 @@ async def db_upload_wrong(message: Message):
 
 
 @router.message(Command("stats"))
+
+@router.message(Command("stats"))
 @router.message(Command("stata"))
+@router.message(Command("Stata"))
+async def group_stata(message: Message):
+    if user_role(message.from_user.id) not in {"chief_admin", "admin", "operator"}:
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Команда работает только в рабочей группе или топике.")
+        return
+
+    chat_id = message.chat.id
+    thread_id = getattr(message, "message_thread_id", None)
+
+    where = "work_chat_id=?"
+    params = [chat_id]
+    if thread_id:
+        where += " AND work_thread_id=?"
+        params.append(thread_id)
+
+    totals = db.conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
+            SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
+            SUM(CASE WHEN taken_by_admin IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) AS in_progress_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total,
+            SUM(CASE WHEN status='failed' AND fail_reason='slip' THEN 1 ELSE 0 END) AS slip_total,
+            SUM(CASE WHEN status='failed' AND fail_reason='error' THEN 1 ELSE 0 END) AS error_total,
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+        FROM queue_items
+        WHERE {where}
+        """,
+        tuple(params),
+    ).fetchone()
+
+    per_operator = db.conn.execute(
+        f"""
+        SELECT
+            operator_key,
+            COUNT(*) AS total,
+            SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
+            SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+        FROM queue_items
+        WHERE {where}
+        GROUP BY operator_key
+        ORDER BY total DESC, operator_key ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    per_taker = db.conn.execute(
+        f"""
+        SELECT
+            taken_by_admin AS taker_user_id,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total,
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+        FROM queue_items
+        WHERE {where} AND taken_by_admin IS NOT NULL
+        GROUP BY taken_by_admin
+        ORDER BY total DESC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    op_lines = []
+    for row in per_operator:
+        op_lines.append(
+            f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
+            f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
+            f"💰 <b>{usd(row['paid_total'] or 0)}</b>"
+        )
+    if not op_lines:
+        op_lines = ["• Пока пусто"]
+
+    taker_lines = []
+    for row in per_taker:
+        uid = int(row["taker_user_id"])
+        user = db.get_user(uid)
+        name = escape(user["full_name"]) if user and user["full_name"] else str(uid)
+        taker_lines.append(
+            f"• <b>{name}</b> — взял: {int(row['total'] or 0)}, "
+            f"успешно: {int(row['completed_total'] or 0)}, "
+            f"оплат: <b>{usd(row['paid_total'] or 0)}</b>"
+        )
+    if not taker_lines:
+        taker_lines = ["• Пока никто не брал номера"]
+
+    text_msg = (
+        "<b>📊 Статистика группы / топика</b>\n\n"
+        f"📦 Всего заявок: <b>{int(totals['total'] or 0)}</b>\n"
+        f"🙋 Взято номеров: <b>{int(totals['taken_total'] or 0)}</b>\n"
+        f"🚀 В работе: <b>{int(totals['in_progress_total'] or 0)}</b>\n"
+        f"⏳ Холд: <b>{int(totals['hold_total'] or 0)}</b>\n"
+        f"⚡ БезХолд: <b>{int(totals['no_hold_total'] or 0)}</b>\n"
+        f"✅ Успешно: <b>{int(totals['completed_total'] or 0)}</b>\n"
+        f"❌ Слеты: <b>{int(totals['slip_total'] or 0)}</b>\n"
+        f"⚠️ Ошибки: <b>{int(totals['error_total'] or 0)}</b>\n"
+        f"💰 Тотал оплат: <b>{usd(totals['paid_total'] or 0)}</b>\n\n"
+        "<b>📱 По операторам</b>\n" + "\n".join(op_lines) + "\n\n"
+        "<b>👥 Кто сколько взял</b>\n" + "\n".join(taker_lines)
+    )
+    await message.answer(text_msg)
+
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
     if user_role(message.from_user.id) not in {"chief_admin", "admin", "operator"}:
