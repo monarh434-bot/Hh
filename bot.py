@@ -116,6 +116,7 @@ class AdminStates(StatesGroup):
     waiting_group_stats_lookup = State()
     waiting_db_upload = State()
     waiting_channel_value = State()
+    waiting_backup_channel = State()
 
 
 @dataclass
@@ -309,6 +310,8 @@ class Database:
             "start_subtitle": "Премиум сервис приёма номеров",
             "start_description": "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>",
             "announcement_text": "",
+            "backup_channel_id": "0",
+            "backup_enabled": "0",
         }
         for key, value in defaults.items():
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
@@ -703,6 +706,24 @@ class Database:
             (user_id,),
         ).fetchall()
 
+
+    def recover_after_restart(self):
+        # Return items that were merely taken but never started back into the queue
+        self.conn.execute(
+            """
+            UPDATE queue_items
+            SET status='queued',
+                taken_by_admin=NULL,
+                taken_at=NULL
+            WHERE status='taken' AND (work_started_at IS NULL OR work_started_at='')
+            """
+        )
+        # Force timer re-render on active holds after restart
+        self.conn.execute(
+            "UPDATE queue_items SET timer_last_render=NULL WHERE status='in_progress' AND mode='hold'"
+        )
+        self.conn.commit()
+
     def group_stats(self, chat_id: int, thread_id: Optional[int]):
         return self.conn.execute(
             """
@@ -754,6 +775,22 @@ def is_admin(user_id: int) -> bool:
 
 def is_operator_or_admin(user_id: int) -> bool:
     return user_role(user_id) in {"chief_admin", "admin", "operator"}
+
+
+def is_chief_admin(user_id: int) -> bool:
+    return user_role(user_id) == "chief_admin"
+
+def is_backup_enabled() -> bool:
+    return db.get_setting("backup_enabled", "0") == "1"
+
+def set_backup_enabled(enabled: bool):
+    db.set_setting("backup_enabled", "1" if enabled else "0")
+
+def backup_channel_id() -> int:
+    try:
+        return int(db.get_setting("backup_channel_id", "0") or 0)
+    except Exception:
+        return 0
 
 
 def normalize_phone(raw: str) -> Optional[str]:
@@ -1445,6 +1482,8 @@ def render_admin_settings() -> str:
         f"📝 Старт-заголовок: <b>{escape(db.get_setting('start_title', 'ESIM Service X'))}</b>\n"
         f"💸 Канал выплат: <code>{escape(db.get_setting('withdraw_channel_id', str(WITHDRAW_CHANNEL_ID)))}</code>\n"
         f"🧾 Канал логов: <code>{escape(db.get_setting('log_channel_id', str(LOG_CHANNEL_ID)))}</code>\n"
+        f"🗄 Канал автобэкапа: <code>{escape(db.get_setting('backup_channel_id', '0'))}</code>\n"
+        f"🔁 Автовыгрузка БД: <b>{'Включена' if is_backup_enabled() else 'Выключена'}</b>\n"
         f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
     )
 
@@ -1482,6 +1521,8 @@ def settings_kb():
     kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
     kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
+    kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
+    kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -1861,6 +1902,42 @@ async def notify_user(bot: Bot, user_id: int, text: str):
     except Exception:
         logging.exception("notify_user failed")
 
+
+
+async def send_db_backup(bot: Bot, reason: str = "auto"):
+    channel_id = backup_channel_id()
+    if not channel_id:
+        return False
+    db_path = Path(DB_PATH)
+    if not db_path.exists():
+        logging.warning("DB backup skipped: DB file not found")
+        return False
+    backup_dir = Path("db_backups")
+    backup_dir.mkdir(exist_ok=True)
+    stamp = msk_now().strftime("%Y%m%d_%H%M%S")
+    target = backup_dir / f"botdb_{reason}_{stamp}.db"
+    try:
+        target.write_bytes(db_path.read_bytes())
+        caption = (
+            "<b>🗄 Автовыгрузка базы данных</b>\n\n"
+            f"🕒 {escape(now_str())}\n"
+            f"🔖 Причина: <b>{escape(reason)}</b>"
+        )
+        await bot.send_document(channel_id, FSInputFile(str(target)), caption=caption)
+        logging.info("DB backup sent to %s (%s)", channel_id, reason)
+        return True
+    except Exception:
+        logging.exception("send_db_backup failed")
+        return False
+
+async def backup_watcher(bot: Bot):
+    while True:
+        try:
+            if is_backup_enabled() and backup_channel_id():
+                await send_db_backup(bot, "auto_15m")
+        except Exception:
+            logging.exception("backup_watcher failed")
+        await asyncio.sleep(900)
 
 async def send_log(bot: Bot, text: str):
     logging.info(re.sub(r"<[^>]+>", "", text))
@@ -4009,7 +4086,8 @@ async def group_stata(message: Message):
 
 @router.callback_query(F.data == "admin:set_log_channel")
 async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
-    if user_role(callback.from_user.id) != "chief_admin":
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
         return
     await state.update_data(channel_target="log_channel_id")
     await state.set_state(AdminStates.waiting_channel_value)
@@ -4048,16 +4126,19 @@ async def main():
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Укажи BOT_TOKEN прямо в bot.py")
 
+    db.recover_after_restart()
     primary_bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     LIVE_DP = dp
 
     asyncio.create_task(hold_watcher(primary_bot))
+    asyncio.create_task(backup_watcher(primary_bot))
 
     try:
         me = await primary_bot.get_me()
         logging.info("Primary bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
+        logging.info("Anti-crash recovery complete; holds and queue state restored")
     except Exception:
         logging.exception("Primary bot get_me failed")
 
