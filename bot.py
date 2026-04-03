@@ -938,7 +938,6 @@ def admin_root_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Сводка", callback_data="admin:summary")
     kb.button(text="📈 Стата групп", callback_data="admin:group_stats_panel")
-    kb.button(text="🏦 Казна", callback_data="admin:treasury")
     kb.button(text="💸 Выводы", callback_data="admin:withdraws")
     kb.button(text="⏳ Холд", callback_data="admin:hold")
     kb.button(text="💎 Прайсы", callback_data="admin:prices")
@@ -947,7 +946,7 @@ def admin_root_kb():
     kb.button(text="📦 Очередь", callback_data="admin:queues")
     kb.button(text="👤 Пользователь", callback_data="admin:user_tools")
     kb.button(text="⚙️ Настройки", callback_data="admin:settings")
-    kb.adjust(2,2,2,2,2,2)
+    kb.adjust(2,2,2,2,1)
     return kb.as_markup()
 
 
@@ -1401,7 +1400,6 @@ def render_admin_home() -> str:
         "<b>⚙️ Admin Panel — ESIM Service X</b>\n\n"
         f"👑 Главный админ: <code>{CHIEF_ADMIN_ID}</code>\n"
         f"💸 Заявок на вывод: <b>{db.count_pending_withdrawals()}</b>\n"
-        f"🏦 Казна: <b>{usd(db.get_treasury())}</b>\n"
         f"⏳ Холд: <b>{db.get_setting('hold_minutes')}</b> мин.\n"
         f"📉 Мин. вывод: <b>{usd(float(db.get_setting('min_withdraw', str(MIN_WITHDRAW))))}</b>\n"
         f"📥 Сдача номеров: <b>{'Включена' if is_numbers_enabled() else 'Выключена'}</b>\n"
@@ -1452,6 +1450,19 @@ def render_operator_modes() -> str:
         nh_status = "✅" if is_operator_mode_enabled(key, "no_hold") else "🚫"
         lines.append(f"{op_text(key)}\n• Холд: {hold_status}\n• БезХолд: {nh_status}")
     return "<b>🎛 Приём номеров по операторам</b>\n\n" + "\n\n".join(lines)
+
+def settings_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
+    kb.button(text="📥 Вкл/Выкл приём номеров", callback_data="admin:toggle_numbers")
+    kb.button(text="🎛 Приём номеров по операторам", callback_data="admin:operator_modes")
+    kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
+    kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
+    kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
+    kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
 
 def operator_modes_kb():
     kb = InlineKeyboardBuilder()
@@ -1627,7 +1638,7 @@ def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_
         """,
         (
             user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-            qr_file_id, get_mode_price(operator_key, mode), now_str(), mode
+            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode
         ),
     )
     db.conn.commit()
@@ -1865,7 +1876,6 @@ def resolve_user_input(raw: str):
         user = db.find_last_user_by_phone(cleaned)
         if user:
             return user
-
         variants = []
         if cleaned.startswith("8") and len(cleaned) == 11:
             variants += ["7" + cleaned[1:], "+" + "7" + cleaned[1:]]
@@ -1873,12 +1883,10 @@ def resolve_user_input(raw: str):
             variants += ["8" + cleaned[1:], "+" + cleaned]
         else:
             variants += ["+" + cleaned]
-
         for v in variants:
             user = db.find_last_user_by_phone(v)
             if user:
                 return user
-
     return None
 
 
@@ -2209,7 +2217,7 @@ async def submit_qr(message: Message, state: FSMContext):
         f"🧾 ID заявки: <b>{item_id}</b>\n"
         f"📱 Оператор: {op_html(operator_key)}\n"
         f"📞 Номер: <code>{pretty_phone(phone)}</code>\n"
-        f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode))}</b>\n"
+        f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode, message.from_user.id))}</b>\n"
         f"🔄 Режим: <b>{'Холд' if mode == 'hold' else 'БезХолд'}</b>",
         reply_markup=submit_result_kb(),
     )
@@ -2529,7 +2537,7 @@ async def admin_groupstat_open(callback: CallbackQuery):
 async def admin_settings(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_admin_settings(), reply_markup=settings_kb())
+    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
     await callback.answer()
 
 
@@ -3729,7 +3737,7 @@ async def admin_user_price_op(callback: CallbackQuery):
     logging.info("user-section handler: op | text=%s | user=%s", getattr(message if 'op' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'op' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, uid, operator_key = callback.data.split(":")
+    _, _, uid, operator_key = callback.data.split(":")
     await safe_edit_or_send(
         callback,
         f"<b>Пользователь:</b> <code>{uid}</code>\n<b>Оператор:</b> {op_text(operator_key)}\n\n<b>Выберите режим:</b>",
@@ -3743,7 +3751,7 @@ async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
     logging.info("user-section handler: mode | text=%s | user=%s", getattr(message if 'mode' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'mode' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, uid, operator_key, mode = callback.data.split(":")
+    _, _, uid, operator_key, mode = callback.data.split(":")
     await state.set_state(AdminStates.waiting_user_price_value)
     await state.update_data(target_user_id=int(uid), operator_key=operator_key, price_mode=mode)
     await callback.message.answer(
