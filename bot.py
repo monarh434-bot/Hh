@@ -1882,7 +1882,8 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message((WithdrawStates.waiting_amount | WithdrawStates.waiting_payment_link), F.text == "↩️ Назад")
+@router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
+@router.message(WithdrawStates.waiting_payment_link, F.text == "↩️ Назад")
 async def global_back(message: Message, state: FSMContext):
     await state.clear()
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
