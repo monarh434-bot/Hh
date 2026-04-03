@@ -107,6 +107,7 @@ class AdminStates(StatesGroup):
     waiting_user_action_id = State()
     waiting_user_action_value = State()
     waiting_user_action_text = State()
+    waiting_user_custom_price_text = State()
     waiting_db_upload = State()
     waiting_channel_value = State()
 
@@ -209,6 +210,19 @@ class Database:
                 fail_reason TEXT,
                 completed_at TEXT,
                 timer_last_render TEXT
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_prices (
+                user_id INTEGER NOT NULL,
+                operator_key TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                price REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, operator_key, mode)
             )
             """
         )
@@ -448,7 +462,7 @@ class Database:
                 pretty_phone(normalized_phone),
                 normalized_phone,
                 qr_file_id,
-                get_mode_price(operator_key, mode),
+                get_mode_price(operator_key, mode, user_id),
                 now_str(),
                 mode,
             ),
@@ -536,6 +550,34 @@ class Database:
         self.conn.execute("UPDATE queue_items SET timer_last_render=? WHERE id=?", (now_str(), item_id))
         self.conn.commit()
 
+
+    def set_user_price(self, user_id: int, operator_key: str, mode: str, price: float):
+        self.conn.execute(
+            "INSERT INTO user_prices (user_id, operator_key, mode, price, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, operator_key, mode) DO UPDATE SET price=excluded.price, updated_at=excluded.updated_at",
+            (user_id, operator_key, mode, price, now_str()),
+        )
+        self.conn.commit()
+
+    def delete_user_price(self, user_id: int, operator_key: str, mode: str):
+        self.conn.execute(
+            "DELETE FROM user_prices WHERE user_id=? AND operator_key=? AND mode=?",
+            (user_id, operator_key, mode),
+        )
+        self.conn.commit()
+
+    def get_user_price(self, user_id: int, operator_key: str, mode: str):
+        row = self.conn.execute(
+            "SELECT price FROM user_prices WHERE user_id=? AND operator_key=? AND mode=?",
+            (user_id, operator_key, mode),
+        ).fetchone()
+        return float(row["price"]) if row else None
+
+    def list_user_prices(self, user_id: int):
+        return self.conn.execute(
+            "SELECT * FROM user_prices WHERE user_id=? ORDER BY operator_key, mode",
+            (user_id,),
+        ).fetchall()
 
     def set_payout_link(self, user_id: int, payout_link: str):
         self.conn.execute(
@@ -941,6 +983,7 @@ def prices_kb():
 def user_admin_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Статистика пользователя", callback_data="admin:user_stats")
+    kb.button(text="💎 Персональный прайс", callback_data="admin:user_set_price")
     kb.button(text="✉️ Написать в ЛС", callback_data="admin:user_pm")
     kb.button(text="➕ Начислить деньги", callback_data="admin:user_add_balance")
     kb.button(text="➖ Снять деньги", callback_data="admin:user_sub_balance")
@@ -1405,7 +1448,11 @@ def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_
     return cur.lastrowid
 
 
-def get_mode_price(operator_key: str, mode: str) -> float:
+def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> float:
+    if user_id is not None:
+        custom = db.get_user_price(user_id, operator_key, mode)
+        if custom is not None:
+            return float(custom)
     legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]['price']))
     return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
@@ -1457,10 +1504,10 @@ def touch_user(user_id: int, username: str, full_name: str):
 def phone_locked_until_next_msk_day(normalized_phone: str) -> bool:
     start, end = msk_day_window()
     row = db.conn.execute(
-        "SELECT 1 FROM queue_items WHERE normalized_phone=? AND work_started_at IS NOT NULL AND work_started_at >= ? AND work_started_at < ? LIMIT 1",
+        "SELECT COUNT(*) AS c FROM queue_items WHERE normalized_phone=? AND work_started_at IS NOT NULL AND work_started_at >= ? AND work_started_at < ?",
         (normalized_phone, start, end),
     ).fetchone()
-    return bool(row)
+    return int((row["c"] if row else 0) or 0) >= 2
 
 
 def user_today_queue_items(user_id: int):
@@ -3057,7 +3104,7 @@ async def slip_cb(callback: CallbackQuery):
     await send_log(callback.bot, f"<b>❌ Слет</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>\n📱 {op_html(item.operator_key)}")
     await callback.answer("Слет отмечен")
 
-@router.callback_query(F.data.in_(["admin:user_stats", "admin:user_pm", "admin:user_add_balance", "admin:user_sub_balance", "admin:user_ban", "admin:user_unban"]))
+@router.callback_query(F.data.in_(["admin:user_stats", "admin:user_set_price", "admin:user_pm", "admin:user_add_balance", "admin:user_sub_balance", "admin:user_ban", "admin:user_unban"]))
 async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
@@ -3087,6 +3134,11 @@ async def admin_user_action_id(message: Message, state: FSMContext):
             await message.answer("Пользователь не найден.")
             return
         ops_text = "\n".join([f"• {op_text(row['operator_key'])}: {row['total']} / {usd(row['earned'] or 0)}" for row in ops]) or "• Пока пусто"
+        custom_prices = db.list_user_prices(target_user_id)
+        custom_text = "\n".join(
+            f"• {op_text(row['operator_key'])} • {mode_label(row['mode'])} = <b>{usd(row['price'])}</b>"
+            for row in custom_prices
+        ) or "• Нет"
         text_msg = (
             f"<b>👤 Пользователь</b>\n\n"
             f"🆔 <code>{target_user_id}</code>\n"
@@ -3095,7 +3147,8 @@ async def admin_user_action_id(message: Message, state: FSMContext):
             f"💰 Баланс: <b>{usd(user['balance'])}</b>\n\n"
             f"📊 Всего: <b>{stats['total'] or 0}</b> | ✅ <b>{stats['completed'] or 0}</b> | ❌ <b>{stats['slipped'] or 0}</b> | ⚠️ <b>{stats['errors'] or 0}</b>\n"
             f"💵 Заработано: <b>{usd(stats['earned'] or 0)}</b>\n\n"
-            f"<b>📱 По операторам</b>\n{ops_text}"
+            f"<b>📱 По операторам</b>\n{ops_text}\n\n"
+            f"<b>💎 Персональные прайсы</b>\n{custom_text}"
         )
         await state.clear()
         await message.answer(text_msg)
@@ -3112,6 +3165,24 @@ async def admin_user_action_id(message: Message, state: FSMContext):
     if action in {"add_balance", "sub_balance"}:
         await state.set_state(AdminStates.waiting_user_action_value)
         await message.answer("Введите сумму в $:")
+        return
+    if action == "set_price":
+        prices = db.list_user_prices(target_user_id)
+        current = "\n".join(
+            f"• {op_text(row['operator_key'])} • {mode_label(row['mode'])} = <b>{usd(row['price'])}</b>"
+            for row in prices
+        ) or "• Индивидуальные прайсы не заданы."
+        await state.set_state(AdminStates.waiting_user_custom_price_text)
+        await message.answer(
+            "<b>Введите персональный прайс</b>\n\n"
+            f"Пользователь: <code>{target_user_id}</code>\n\n"
+            "<b>Текущие персональные прайсы:</b>\n"
+            f"{current}\n\n"
+            "Формат: <code>оператор режим цена</code>\n"
+            "Пример: <code>mts hold 6.5</code>\n"
+            "Или: <code>mega no_hold 7</code>\n"
+            "Чтобы удалить персональный прайс: <code>mts hold reset</code>"
+        )
         return
     await state.clear()
 
