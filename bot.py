@@ -214,6 +214,7 @@ class Database:
             """
         )
 
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_prices (
@@ -310,6 +311,8 @@ class Database:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (f"price_{key}", str(data["price"])),
             )
+            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
+            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
         self.conn.execute(
@@ -549,6 +552,7 @@ class Database:
     def touch_timer_render(self, item_id: int):
         self.conn.execute("UPDATE queue_items SET timer_last_render=? WHERE id=?", (now_str(), item_id))
         self.conn.commit()
+
 
 
     def set_user_price(self, user_id: int, operator_key: str, mode: str, price: float):
@@ -959,7 +963,7 @@ def hold_kb():
 def settings_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
-    kb.button(text="🎛 Приём номеров", callback_data="admin:operator_modes")
+    kb.button(text="🎛 Приём номеров по операторам", callback_data="admin:operator_modes")
     kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
     kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
     kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
@@ -1821,7 +1825,7 @@ async def mirror_token_received(message: Message, state: FSMContext):
     )
     started, info = await start_live_mirror(token)
     await state.clear()
-    extra = "Зеркало сразу запущено и уже должно отвечать." if started else f"Зеркало сохранено. Автозапуск сейчас не удался: {escape(str(info))}"
+    extra = "Зеркало сразу запущено и уже должно отвечать." if started else f"Зеркало сохранено, но автозапуск сейчас не удался: {escape(str(info))}"
     await send_banner_message(
         message,
         db.get_setting('start_banner_path', START_BANNER),
@@ -1831,46 +1835,6 @@ async def mirror_token_received(message: Message, state: FSMContext):
         f"{extra}",
         mirror_menu_kb(),
     )
-
-@router.callback_query(F.data == "menu:profile")
-async def profile_cb(callback: CallbackQuery, state: FSMContext):
-    touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
-    await state.clear()
-    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:my")
-async def my_numbers_cb(callback: CallbackQuery, state: FSMContext):
-    touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
-    await state.clear()
-    items = user_today_queue_items(callback.from_user.id)
-    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:withdraw")
-async def withdraw_menu_cb(callback: CallbackQuery, state: FSMContext):
-    payout_link = db.get_payout_link(callback.from_user.id)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="↩️ Назад", callback_data="menu:profile")
-    kb.adjust(1)
-    if not payout_link:
-        await state.set_state(WithdrawStates.waiting_payment_link)
-        await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw_setup(), kb.as_markup())
-    else:
-        await state.set_state(WithdrawStates.waiting_amount)
-        await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), kb.as_markup())
-    await callback.answer()
-
-
-@router.message(F.text == "👤 Профиль")
-async def profile_view(message: Message, state: FSMContext):
-    touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
-    await remove_reply_keyboard(message)
-    await state.clear()
-    await send_banner_message(message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(message.from_user.id), profile_kb())
-
 
 @router.callback_query(F.data == "menu:payout_link")
 async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
@@ -2417,13 +2381,13 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     parts = callback.data.split(":")
-    if len(parts) != 4 and len(parts) != 5:
-        await callback.answer("Некорректные данные прайса", show_alert=True)
-        return
-    if len(parts) == 5:
+    if len(parts) == 4:
+        _, _, price_mode, operator_key = parts
+    elif len(parts) == 5:
         _, _, _, price_mode, operator_key = parts
     else:
-        _, _, price_mode, operator_key = parts
+        await callback.answer("Некорректные данные прайса", show_alert=True)
+        return
     if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
         await callback.answer("Некорректные данные прайса", show_alert=True)
         return
@@ -2838,6 +2802,21 @@ async def track_any_message(message: Message):
 
 
 
+async def mirror_polling_loop(bot: Bot):
+    offset = 0
+    while True:
+        try:
+            updates = await bot.get_updates(offset=offset, timeout=25, allowed_updates=["message", "callback_query"])
+            for upd in updates:
+                offset = upd.update_id + 1
+                try:
+                    await LIVE_DP.feed_update(bot, upd)
+                except Exception:
+                    logging.exception("mirror feed_update failed")
+        except Exception:
+            logging.exception("mirror polling loop failed")
+            await asyncio.sleep(3)
+
 async def start_live_mirror(token: str):
     global LIVE_DP
     token = (token or "").strip()
@@ -2848,8 +2827,8 @@ async def start_live_mirror(token: str):
     try:
         mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         me = await mirror_bot.get_me()
-        task = asyncio.create_task(LIVE_DP.start_polling(mirror_bot))
-        LIVE_MIRROR_TASKS[token] = {"task": task, "username": me.username or ""}
+        task = asyncio.create_task(mirror_polling_loop(mirror_bot))
+        LIVE_MIRROR_TASKS[token] = {"task": task, "username": me.username or "", "bot": mirror_bot}
         logging.info("Live mirror started as @%s", me.username or "unknown")
         return True, me.username or ""
     except Exception as e:
@@ -3179,8 +3158,8 @@ async def admin_user_action_id(message: Message, state: FSMContext):
             "<b>Текущие персональные прайсы:</b>\n"
             f"{current}\n\n"
             "Формат: <code>оператор режим цена</code>\n"
-            "Пример: <code>mts hold 6.5</code>\n"
-            "Или: <code>mega no_hold 7</code>\n"
+            "Пример: <code>bil no_hold 6.5</code>\n"
+            "Или: <code>mts hold 7</code>\n"
             "Чтобы удалить персональный прайс: <code>mts hold reset</code>"
         )
         return
@@ -3379,7 +3358,6 @@ async def main():
     except Exception:
         logging.exception("Primary bot get_me failed")
 
-    # Поднимаем зеркала из базы как отдельные polling-task без редеплоя.
     for mirror in db.all_active_mirrors():
         token = (mirror["token"] or "").strip()
         if not token or token == BOT_TOKEN:
