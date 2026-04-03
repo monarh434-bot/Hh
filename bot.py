@@ -79,6 +79,7 @@ class SubmitStates(StatesGroup):
 
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
+    waiting_payment_link = State()
 
 class MirrorStates(StatesGroup):
     waiting_token = State()
@@ -208,6 +209,17 @@ class Database:
             )
             """
         )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payout_accounts (
+                user_id INTEGER PRIMARY KEY,
+                payout_link TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals (
@@ -281,6 +293,8 @@ class Database:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (f"price_{key}", str(data["price"])),
             )
+            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
+            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
         self.conn.execute(
             "INSERT OR IGNORE INTO roles (user_id, role, assigned_at) VALUES (?, 'chief_admin', ?)",
             (CHIEF_ADMIN_ID, now_str()),
@@ -304,14 +318,14 @@ class Database:
         cur.execute(
             """
             INSERT INTO mirrors (owner_user_id, owner_username, token, bot_id, bot_username, bot_title, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'saved', ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
             ON CONFLICT(token) DO UPDATE SET
                 owner_user_id=excluded.owner_user_id,
                 owner_username=excluded.owner_username,
                 bot_id=excluded.bot_id,
                 bot_username=excluded.bot_username,
                 bot_title=excluded.bot_title,
-                status='saved'
+                status='active'
             """,
             (owner_user_id, owner_username, token, bot_id, bot_username, bot_title, now_str()),
         )
@@ -519,6 +533,18 @@ class Database:
         self.conn.execute("UPDATE queue_items SET timer_last_render=? WHERE id=?", (now_str(), item_id))
         self.conn.commit()
 
+
+    def set_payout_link(self, user_id: int, payout_link: str):
+        self.conn.execute(
+            "INSERT INTO payout_accounts (user_id, payout_link, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET payout_link=excluded.payout_link, updated_at=excluded.updated_at",
+            (user_id, payout_link, now_str()),
+        )
+        self.conn.commit()
+
+    def get_payout_link(self, user_id: int) -> Optional[str]:
+        row = self.conn.execute("SELECT payout_link FROM payout_accounts WHERE user_id=?", (user_id,)).fetchone()
+        return row["payout_link"] if row else None
+
     def create_withdrawal(self, user_id: int, amount: float):
         cur = self.conn.cursor()
         cur.execute(
@@ -575,6 +601,13 @@ class Database:
         self.conn.execute(
             "INSERT INTO workspaces (chat_id, thread_id, mode, added_by, created_at, is_enabled) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(chat_id, thread_id, mode) DO UPDATE SET is_enabled=1, added_by=excluded.added_by, created_at=excluded.created_at",
             (chat_id, thread_id, mode, added_by, now_str()),
+        )
+        self.conn.commit()
+
+    def disable_workspace(self, chat_id: int, thread_id: Optional[int], mode: str):
+        self.conn.execute(
+            "UPDATE workspaces SET is_enabled=0 WHERE chat_id=? AND ((thread_id IS NULL AND ? IS NULL) OR thread_id=?) AND mode=?",
+            (chat_id, thread_id, thread_id, mode),
         )
         self.conn.commit()
 
@@ -754,7 +787,8 @@ def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:ba
     for key in OPERATORS:
         q = count_waiting_mode(key, mode)
         price = get_mode_price(key, mode)
-        kb.button(text=f"{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+        prefix_mark = "🚫 " if not is_operator_mode_enabled(key, mode) else ""
+        kb.button(text=f"{prefix_mark}{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
@@ -784,6 +818,13 @@ def mode_kb():
     kb.button(text="⚡ БезХолд", callback_data="mode:no_hold")
     kb.button(text="↩️ Назад", callback_data="mode:back")
     kb.adjust(2, 1)
+    return kb.as_markup()
+
+def submit_result_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📲 Сдать ещё", callback_data="menu:submit")
+    kb.button(text="🏠 Домой", callback_data="menu:home")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -864,6 +905,7 @@ def hold_kb():
 def settings_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
+    kb.button(text="🎛 Приём номеров", callback_data="admin:operator_modes")
     kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
     kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
     kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
@@ -1024,6 +1066,8 @@ def render_profile(user_id: int) -> str:
     current_queue = int((stats['queued'] or 0) + (stats['taken'] or 0) + (stats['in_progress'] or 0))
     username = f"@{escape(user['username'])}" if user and user['username'] else "—"
     full_name = escape(user['full_name'] if user else '')
+    payout_link = db.get_payout_link(user_id)
+    payout_status = "✅ Привязан" if payout_link else "❌ Не привязан"
     ops_text = "\n".join(
         f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
         for row in ops
@@ -1035,6 +1079,7 @@ def render_profile(user_id: int) -> str:
             f"™️ <b>Username:</b> {username}",
             f"®️ <b>ID:</b> <code>{user_id}</code>",
             f"💲 <b>Баланс:</b> <b>{usd(user['balance'] if user else 0)}</b>",
+            f"💳 <b>Счёт CryptoBot:</b> {payout_status}",
         ])
         + "\n\n<b>📊 Ваша статистика:</b>\n"
         + quote_block([
@@ -1050,7 +1095,6 @@ def render_profile(user_id: int) -> str:
         + "\n\n<i>Профиль обновляется автоматически по мере работы в боте.</i>"
     )
 
-
 def render_withdraw(user_id: int) -> str:
     user = db.get_user(user_id)
     balance = usd(float(user['balance'] if user else 0))
@@ -1064,6 +1108,17 @@ def render_withdraw(user_id: int) -> str:
         + "\n\n🔹 <b>Введите сумму вывода в $:</b>"
     )
 
+def render_withdraw_setup() -> str:
+    return (
+        "<b>Вывод средств - ESIM Service X 💫</b>\n\n"
+        "🧾 <b>Сумма вывода:</b> —\n\n"
+        "<b>💳 Настройка оплаты (CryptoBot)</b>\n\n"
+        "Для получения выплат мне необходима ваша ссылка на многоразовый счет.\n\n"
+        "<b>Инструкция:</b>\n"
+        "Способ 1: напишите <b>@send</b> и выберите <b>Создать многоразовый счет</b>. Сумму не указывайте.\n\n"
+        "Способ 2: В <b>@CryptoBot</b> пропишите <code>/invoices</code> — Создать счёт — Многоразовый — USDT — Далее и скопируйте ссылку.\n\n"
+        "👉 <b>Просто отправьте скопированную ссылку прямо мне в чат, и я её запомню.</b>"
+    )
 
 def render_my_numbers(user_id: int) -> str:
     items = user_today_queue_items(user_id)
@@ -1089,7 +1144,7 @@ def render_mirror_menu(user_id: int) -> str:
     rows = db.user_mirrors(user_id)
     if rows:
         body = "\n".join(
-            f"• @{escape(row['bot_username'] or 'unknown_bot')} — <b>{escape(row['status'])}</b>"
+            f"• @{escape(row['bot_username'] or 'unknown_bot')} — <b>{'запущено' if row['status'] == 'active' else escape(row['status'])}</b>"
             for row in rows
         )
     else:
@@ -1151,6 +1206,26 @@ def render_admin_settings() -> str:
         f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
     )
 
+def render_operator_modes() -> str:
+    lines = []
+    for key, data in OPERATORS.items():
+        hold_status = "✅" if is_operator_mode_enabled(key, "hold") else "🚫"
+        nh_status = "✅" if is_operator_mode_enabled(key, "no_hold") else "🚫"
+        lines.append(f"{op_text(key)}\n• Холд: <b>{hold_status}</b>\n• БезХолд: <b>{nh_status}</b>")
+    return "<b>🎛 Приём номеров по операторам</b>\n\n" + "\n\n".join(lines)
+
+def operator_modes_kb():
+    kb = InlineKeyboardBuilder()
+    for mode in ("hold", "no_hold"):
+        mode_label_text = "⏳ Холд" if mode == "hold" else "⚡ БезХолд"
+        for key in OPERATORS:
+            status = "✅" if is_operator_mode_enabled(key, mode) else "🚫"
+            kb.button(text=f"{status} {mode_label_text} • {op_text(key)}", callback_data=f"admin:toggle_avail:{mode}:{key}")
+    kb.button(text="↩️ Назад", callback_data="admin:settings")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 
 def render_design() -> str:
     return (
@@ -1203,7 +1278,7 @@ def render_roles() -> str:
 def render_workspaces() -> str:
     rows = db.list_workspaces()
     if not rows:
-        body = "Нет активных рабочих зон.\n\n• /work — включить группу\n• /topic — включить топик"
+        body = "Нет активных рабочих зон.\n\n• /work — включить или выключить группу\n• /topic — включить или выключить топик"
     else:
         body = "\n".join(
             f"• chat <code>{row['chat_id']}</code> | thread <code>{row['thread_id'] or 0}</code> | {row['mode']}"
@@ -1326,6 +1401,12 @@ def is_numbers_enabled() -> bool:
 
 def set_numbers_enabled(flag: bool):
     db.set_setting('numbers_enabled', '1' if flag else '0')
+
+def is_operator_mode_enabled(operator_key: str, mode: str) -> bool:
+    return db.get_setting(f"allow_{mode}_{operator_key}", "1") == "1"
+
+def set_operator_mode_enabled(operator_key: str, mode: str, flag: bool):
+    db.set_setting(f"allow_{mode}_{operator_key}", "1" if flag else "0")
 
 
 def is_user_blocked(user_id: int) -> bool:
@@ -1680,6 +1761,7 @@ async def profile_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Мои номера", callback_data="menu:my")
+    kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
     kb.adjust(1)
@@ -1698,11 +1780,16 @@ async def my_numbers_cb(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "menu:withdraw")
 async def withdraw_menu_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(WithdrawStates.waiting_amount)
+    payout_link = db.get_payout_link(callback.from_user.id)
     kb = InlineKeyboardBuilder()
-    kb.button(text="↩️ Назад", callback_data="menu:home")
+    kb.button(text="↩️ Назад", callback_data="menu:profile")
     kb.adjust(1)
-    await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), kb.as_markup())
+    if not payout_link:
+        await state.set_state(WithdrawStates.waiting_payment_link)
+        await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw_setup(), kb.as_markup())
+    else:
+        await state.set_state(WithdrawStates.waiting_amount)
+        await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), kb.as_markup())
     await callback.answer()
 
 
@@ -1713,6 +1800,7 @@ async def profile_view(message: Message, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Мои номера", callback_data="menu:my")
+    kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
     kb.adjust(1)
@@ -1735,8 +1823,10 @@ async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "mode:back")
 async def mode_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    text = "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:"
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), text, mode_kb())
+    if is_user_blocked(callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
+    else:
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("mode:"))
@@ -1778,6 +1868,9 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
     if operator_key not in OPERATORS:
         await callback.answer("Неизвестный оператор", show_alert=True)
         return
+    if not is_operator_mode_enabled(operator_key, mode):
+        await callback.answer("Сдача по этому оператору и режиму сейчас выключена.", show_alert=True)
+        return
     await state.update_data(operator_key=operator_key, mode=mode)
     await state.set_state(SubmitStates.waiting_qr)
     await replace_banner_message(
@@ -1789,7 +1882,7 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
+@router.message((WithdrawStates.waiting_amount | WithdrawStates.waiting_payment_link), F.text == "↩️ Назад")
 async def global_back(message: Message, state: FSMContext):
     await state.clear()
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
@@ -1834,7 +1927,7 @@ async def submit_qr(message: Message, state: FSMContext):
         f"📞 Номер: <code>{pretty_phone(phone)}</code>\n"
         f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode))}</b>\n"
         f"🔄 Режим: <b>{'Холд' if mode == 'hold' else 'БезХолд'}</b>",
-        reply_markup=main_menu(),
+        reply_markup=submit_result_kb(),
     )
 
 
@@ -1866,17 +1959,17 @@ async def withdraw_amount(message: Message, state: FSMContext):
             f"📉 Минимальный вывод: <b>{usd(minimum)}</b>\n"
             f"💰 Ваш баланс: <b>{usd(balance)}</b>\n\n"
             "⚠️ Введите сумму числом. Например: <code>12.5</code>",
-            reply_markup=cancel_inline_kb("menu:withdraw"),
+            reply_markup=cancel_inline_kb("menu:profile"),
         )
         return
     minimum = float(db.get_setting("min_withdraw", str(MIN_WITHDRAW)))
     user = db.get_user(message.from_user.id)
     balance = float(user["balance"] if user else 0)
     if amount < minimum:
-        await message.answer(f"⚠️ <b>Сумма меньше минимальной.</b> Минимум: <b>{usd(minimum)}</b>", reply_markup=withdraw_back_kb())
+        await message.answer(f"⚠️ <b>Сумма меньше минимальной.</b> Минимум: <b>{usd(minimum)}</b>", reply_markup=cancel_inline_kb("menu:profile"))
         return
     if amount > balance:
-        await message.answer("⚠️ <b>Недостаточно средств на балансе.</b>", reply_markup=withdraw_back_kb())
+        await message.answer("⚠️ <b>Недостаточно средств на балансе.</b>", reply_markup=cancel_inline_kb("menu:profile"))
         return
     await state.clear()
     await message.answer(
@@ -1906,20 +1999,23 @@ async def withdraw_confirm(callback: CallbackQuery):
         return
     db.subtract_balance(callback.from_user.id, amount)
     wd_id = db.create_withdrawal(callback.from_user.id, amount)
+    payout_link = db.get_payout_link(callback.from_user.id) or "—"
     text = (
         "<b>📨 Новая заявка на вывод</b>\n\n"
         f"🧾 ID: <b>{wd_id}</b>\n"
         f"👤 Пользователь: <b>{escape(callback.from_user.full_name)}</b>\n"
         f"🆔 ID: <code>{callback.from_user.id}</code>\n"
-        f"💸 Сумма: <b>{usd(amount)}</b>"
+        f"💸 Сумма: <b>{usd(amount)}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}"
     )
     try:
         await callback.bot.send_message(int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID))), text, reply_markup=withdraw_admin_kb(wd_id))
     except Exception:
         logging.exception("send withdraw to channel failed")
-    await callback.message.edit_text("✅ Заявка на вывод создана. Она отправлена в канал выплат и может быть одобрена или отклонена администратором.")
-    await send_banner_message(callback.message, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+    await callback.message.edit_text("✅ Заявка на вывод создана. Она отправлена в канал выплат.")
+    await send_banner_message(callback.message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
     await callback.answer()
+
 
 
 @router.callback_query(F.data.startswith("wd_ok:"))
@@ -1931,22 +2027,13 @@ async def wd_ok(callback: CallbackQuery):
     if not wd or wd["status"] != "pending":
         await callback.answer("Заявка уже обработана.", show_alert=True)
         return
-    amount = float(wd["amount"])
-    if amount > db.get_treasury():
-        await callback.answer("⚠️ В казне недостаточно средств для создания чека.", show_alert=True)
-        return
-    check_id, check_url, status_msg = await create_crypto_check(amount, int(wd["user_id"]))
-    if not check_id or not check_url:
-        await callback.answer(status_msg, show_alert=True)
-        return
-    db.subtract_treasury(amount)
-    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, str(check_url), f"check_id={check_id}")
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, None, "manual_payout")
     try:
         await callback.bot.send_message(
             int(wd["user_id"]),
             "<b>✅ Заявка на вывод одобрена</b>\n\n"
-            f"💸 Сумма: <b>{usd(amount)}</b>\n"
-            f"🎟 Чек выплаты:\n{check_url}"
+            f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+            "Ожидайте оплату на ваш привязанный счёт CryptoBot."
         )
     except Exception:
         logging.exception("send withdraw approved failed")
@@ -1954,11 +2041,10 @@ async def wd_ok(callback: CallbackQuery):
         "<b>✅ Заявка на вывод одобрена</b>\n\n"
         f"🧾 ID: <b>{withdraw_id}</b>\n"
         f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
-        f"💸 Сумма: <b>{usd(amount)}</b>\n"
-        f"🎟 Чек: {check_url}\n"
-        f"🏦 Остаток казны: <b>{usd(db.get_treasury())}</b>"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+        "Статус: <b>ожидает ручной оплаты администратором</b>"
     )
-    await callback.answer("Чек создан")
+    await callback.answer("Одобрено")
 
 @router.callback_query(F.data.startswith("wd_no:"))
 async def wd_no(callback: CallbackQuery):
@@ -2224,10 +2310,10 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
 async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    operator_key = callback.data.split(":")[-1]
+    _, _, _, price_mode, operator_key = callback.data.split(":")
     await state.set_state(AdminStates.waiting_operator_price)
-    await state.update_data(operator_key=operator_key, mode=mode)
-    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} в $:")
+    await state.update_data(operator_key=operator_key, price_mode=price_mode)
+    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> в $:")
     await callback.answer()
 
 
@@ -2424,8 +2510,12 @@ async def enable_work_group(message: Message):
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эта команда работает только в группе.")
         return
-    db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
-    await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+    if db.is_workspace_enabled(message.chat.id, None, "group"):
+        db.disable_workspace(message.chat.id, None, "group")
+        await message.answer("🛑 Работа в этой группе выключена.")
+    else:
+        db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+        await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
 
 
 @router.message(Command("topic"))
@@ -2439,8 +2529,12 @@ async def enable_work_topic(message: Message):
     if not thread_id:
         await message.answer("Открой нужный топик и выполни /topic внутри него.")
         return
-    db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
-    await message.answer("✅ Этот топик добавлен как рабочий.")
+    if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
+        db.disable_workspace(message.chat.id, thread_id, "topic")
+        await message.answer("🛑 Работа в этом топике выключена.")
+    else:
+        db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+        await message.answer("✅ Этот топик добавлен как рабочий.")
 
 
 async def send_next_item_for_operator(message: Message, operator_key: str):
@@ -3100,16 +3194,41 @@ async def admin_channel_value(message: Message, state: FSMContext):
 
 
 
+
 async def main():
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Укажи BOT_TOKEN прямо в bot.py")
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    primary_bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    asyncio.create_task(hold_watcher(bot))
-    me = await bot.get_me()
-    logging.info("Bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
-    await dp.start_polling(bot)
+
+    bots = [primary_bot]
+    seen_tokens = {BOT_TOKEN}
+
+    # Загружаем зеркала из базы и пытаемся поднять их в этом же процессе.
+    for mirror in db.all_active_mirrors():
+        token = (mirror["token"] or "").strip()
+        if not token or token in seen_tokens:
+            continue
+        try:
+            mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            me = await mirror_bot.get_me()
+            logging.info("Mirror bot loaded as @%s", me.username or "unknown")
+            bots.append(mirror_bot)
+            seen_tokens.add(token)
+        except Exception as e:
+            logging.exception("Mirror bot failed to load: %s", e)
+
+    asyncio.create_task(hold_watcher(primary_bot))
+
+    try:
+        me = await primary_bot.get_me()
+        logging.info("Primary bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
+    except Exception:
+        logging.exception("Primary bot get_me failed")
+
+    await dp.start_polling(*bots)
 
 
 if __name__ == "__main__":
