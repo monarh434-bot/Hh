@@ -11,6 +11,7 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
@@ -79,11 +80,13 @@ class SubmitStates(StatesGroup):
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
 
+class MirrorStates(StatesGroup):
+    waiting_token = State()
+
 class EmojiLookupStates(StatesGroup):
     waiting_target = State()
 
-class MirrorStates(StatesGroup):
-    waiting_token = State()
+
 
 class AdminStates(StatesGroup):
     waiting_hold = State()
@@ -207,21 +210,6 @@ class Database:
         )
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS mirrors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_user_id INTEGER NOT NULL,
-                token TEXT NOT NULL UNIQUE,
-                bot_id INTEGER,
-                bot_username TEXT,
-                bot_first_name TEXT,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        cur.execute(
-            """
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -235,6 +223,22 @@ class Database:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mirrors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                owner_username TEXT,
+                token TEXT NOT NULL UNIQUE,
+                bot_id INTEGER,
+                bot_username TEXT,
+                bot_title TEXT,
+                status TEXT NOT NULL DEFAULT 'saved',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -293,6 +297,37 @@ class Database:
                 (uid, now_str()),
             )
         self.conn.commit()
+
+
+    def save_mirror(self, owner_user_id: int, owner_username: str, token: str, bot_id: int, bot_username: str, bot_title: str):
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO mirrors (owner_user_id, owner_username, token, bot_id, bot_username, bot_title, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'saved', ?)
+            ON CONFLICT(token) DO UPDATE SET
+                owner_user_id=excluded.owner_user_id,
+                owner_username=excluded.owner_username,
+                bot_id=excluded.bot_id,
+                bot_username=excluded.bot_username,
+                bot_title=excluded.bot_title,
+                status='saved'
+            """,
+            (owner_user_id, owner_username, token, bot_id, bot_username, bot_title, now_str()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def user_mirrors(self, owner_user_id: int):
+        return self.conn.execute(
+            "SELECT * FROM mirrors WHERE owner_user_id=? ORDER BY id DESC LIMIT 10",
+            (owner_user_id,),
+        ).fetchall()
+
+    def all_active_mirrors(self):
+        return self.conn.execute(
+            "SELECT * FROM mirrors WHERE status IN ('saved','active') ORDER BY id ASC"
+        ).fetchall()
 
     def get_setting(self, key: str, default: Optional[str] = None) -> str:
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -691,14 +726,8 @@ def my_numbers_kb(items):
     return kb.as_markup()
 
 
-def cancel_inline_kb(back: str = "menu:home"):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="❌ Отмена", callback_data=back)
-    kb.adjust(1)
-    return kb.as_markup()
 
-
-def submit_success_kb():
+def quick_submit_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Сдать ещё номер", callback_data="menu:submit")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
@@ -712,7 +741,11 @@ def mirror_menu_kb():
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
-
+def cancel_inline_kb(back: str = "menu:home"):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data=back)
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:back"):
@@ -1052,25 +1085,19 @@ def render_my_numbers(user_id: int) -> str:
         + "\n\n<i>Здесь можно посмотреть свои заявки за день и убрать из очереди те, что ещё не взяты в работу.</i>"
     )
 
-
-
 def render_mirror_menu(user_id: int) -> str:
-    rows = db.list_mirrors(user_id)
-    if not rows:
-        body = "• У вас пока нет зеркал."
-    else:
+    rows = db.user_mirrors(user_id)
+    if rows:
         body = "\n".join(
             f"• @{escape(row['bot_username'] or 'unknown_bot')} — <b>{escape(row['status'])}</b>"
-            for row in rows[:10]
+            for row in rows
         )
+    else:
+        body = "• Пока зеркал нет."
     return (
         "<b>🪞 Зеркало бота</b>\n\n"
-        "Здесь можно подключить <b>токен другого Telegram-бота</b>, и он будет работать как зеркало этого сервиса: "
-        "те же очереди, те же заявки, та же база, но <b>без дополнительных прав</b>.\n\n"
-        "<b>Как создать:</b>\n"
-        "1. Создайте бота у <b>@BotFather</b>\n"
-        "2. Получите API Token\n"
-        "3. Нажмите <b>Создать зеркало</b> и отправьте токен\n\n"
+        "Здесь можно сохранить токен нового бота от <b>@BotFather</b> и подготовить зеркало.\n"
+        "Зеркало не даёт владельцу никаких админ-прав и работает на общей базе.\n\n"
         "<b>Ваши зеркала:</b>\n"
         + body
     )
@@ -1576,19 +1603,26 @@ async def menu_home(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-
-
 @router.callback_query(F.data == "menu:mirror")
 async def mirror_menu(callback: CallbackQuery, state: FSMContext):
-    touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
     await state.clear()
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_mirror_menu(callback.from_user.id), mirror_menu_kb())
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        render_mirror_menu(callback.from_user.id),
+        mirror_menu_kb(),
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "mirror:list")
 async def mirror_list(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_mirror_menu(callback.from_user.id), mirror_menu_kb())
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        render_mirror_menu(callback.from_user.id),
+        mirror_menu_kb(),
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "mirror:create")
@@ -1600,41 +1634,44 @@ async def mirror_create(callback: CallbackQuery, state: FSMContext):
     await replace_banner_message(
         callback,
         db.get_setting('start_banner_path', START_BANNER),
-        "<b>🪞 Создание зеркала</b>\n\nОтправьте <b>API Token</b> вашего Telegram-бота от <b>@BotFather</b>.\n\n"
-        "После проверки бот попытается сразу запустить зеркало внутри этого же сервиса.",
+        "<b>🪞 Создание зеркала</b>\n\n"
+        "Отправьте <b>API token</b> нового бота от <b>@BotFather</b>.\n"
+        "Этот бот будет сохранён как зеркало сервиса без выдачи дополнительных прав.",
         kb.as_markup(),
     )
     await callback.answer()
 
 @router.message(MirrorStates.waiting_token)
-async def mirror_token_input(message: Message, state: FSMContext):
+async def mirror_token_received(message: Message, state: FSMContext):
     token = (message.text or "").strip()
     if ":" not in token:
-        await message.answer("⚠️ Похоже, это не токен бота. Отправьте токен в формате <code>123456:ABC...</code>")
+        await message.answer("⚠️ Отправьте корректный токен бота от @BotFather.")
         return
-    if token == BOT_TOKEN:
-        await message.answer("⚠️ Это токен основного бота.")
+    try:
+        test_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        me = await test_bot.get_me()
+        await test_bot.session.close()
+    except Exception:
+        await message.answer("❌ Не удалось проверить токен. Проверьте его и попробуйте ещё раз.")
         return
-    existing = db.get_mirror_by_token(token)
-    if existing:
-        await state.clear()
-        ensure_mirror_task(token, existing["bot_username"] or "mirror")
-        await message.answer(f"✅ Зеркало уже было добавлено: <b>@{escape(existing['bot_username'])}</b>", reply_markup=main_menu())
-        return
-    me, err = await validate_bot_token(token)
-    if err or not me:
-        await message.answer(f"❌ Не удалось проверить токен: <code>{escape(err or 'unknown error')}</code>")
-        return
-    db.add_mirror(message.from_user.id, token, int(me.id), me.username or "", me.first_name or "")
-    started = ensure_mirror_task(token, me.username or "mirror")
+    db.save_mirror(
+        message.from_user.id,
+        message.from_user.username or "",
+        token,
+        int(me.id),
+        me.username or "",
+        me.full_name or "",
+    )
     await state.clear()
-    await message.answer(
-        "<b>✅ Зеркало подключено</b>\n\n"
-        f"🤖 Бот: <b>@{escape(me.username or '')}</b>\n"
-        f"🆔 ID: <code>{me.id}</code>\n"
-        f"🚀 Статус запуска: <b>{'запущено' if started else 'уже активно'}</b>\n\n"
-        "Теперь через этого бота тоже можно сдавать номера и пользоваться тем же сервисом.",
-        reply_markup=submit_success_kb(),
+    await send_banner_message(
+        message,
+        db.get_setting('start_banner_path', START_BANNER),
+        "<b>✅ Зеркало сохранено</b>\n\n"
+        f"🤖 Бот: @{escape(me.username or '')}\n"
+        f"🆔 ID: <code>{me.id}</code>\n\n"
+        "Зеркало сохранено в базе. Для стабильной работы отдельного токена нужен отдельный запуск/деплой, "
+        "но шаблон и доступ для сдачи номеров уже подготовлены.",
+        mirror_menu_kb(),
     )
 
 @router.callback_query(F.data == "menu:profile")
@@ -2583,35 +2620,6 @@ async def track_any_message(message: Message):
 
 
 
-
-MIRROR_TASKS: dict[str, asyncio.Task] = {}
-
-async def validate_bot_token(token: str):
-    try:
-        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        me = await bot.get_me()
-        await bot.session.close()
-        return me, None
-    except Exception as e:
-        return None, str(e)
-
-async def run_single_bot(token: str, label: str = "mirror"):
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp_local = Dispatcher(storage=MemoryStorage())
-    dp_local.include_router(router)
-    me = await bot.get_me()
-    logging.info("Mirror bot started as @%s", me.username or label)
-    try:
-        await dp_local.start_polling(bot)
-    finally:
-        await bot.session.close()
-
-def ensure_mirror_task(token: str, label: str = "mirror"):
-    if token in MIRROR_TASKS and not MIRROR_TASKS[token].done():
-        return False
-    MIRROR_TASKS[token] = asyncio.create_task(run_single_bot(token, label))
-    return True
-
 async def hold_watcher(bot: Bot):
     while True:
         try:
@@ -3101,12 +3109,6 @@ async def main():
     asyncio.create_task(hold_watcher(bot))
     me = await bot.get_me()
     logging.info("Bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
-
-    for mirror in db.all_active_mirrors():
-        token = mirror["token"]
-        if token and token != BOT_TOKEN:
-            ensure_mirror_task(token, mirror["bot_username"] or "mirror")
-
     await dp.start_polling(bot)
 
 
