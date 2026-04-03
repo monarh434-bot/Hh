@@ -948,6 +948,11 @@ def admin_back_kb(target: str = "admin:home"):
     kb.button(text="↩️ Назад", callback_data=target)
     return kb.as_markup()
 
+def cancel_flow_kb(target: str = "admin:user_tools"):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data=target)
+    return kb.as_markup()
+
 
 def treasury_kb():
     kb = InlineKeyboardBuilder()
@@ -1313,6 +1318,85 @@ def render_group_stats_panel() -> str:
         "<b>📈 Стата групп</b>\n\n"
         f"📦 Всего заявок в рабочих группах: <b>{int(totals['total'] or 0)}</b>\n"
         f"🙋 Взято: <b>{int(totals['taken_total'] or 0)}</b>\n"
+        f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>\n"
+        f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>\n"
+        f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>\n"
+        f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>\n"
+        f"💰 Тотал оплат: <b>{usd(totals['paid_total'] or 0)}</b>\n\n"
+        "<b>📱 По операторам</b>\n" + "\n".join(op_lines) + "\n\n"
+        "<b>👥 Кто сколько взял</b>\n" + "\n".join(taker_lines)
+    )
+
+def group_scope_label(chat_id: int, thread_id: Optional[int]) -> str:
+    return f"💬 {chat_id}" + (f" • 🧵 {thread_id}" if thread_id else "")
+
+def group_stats_select_kb():
+    kb = InlineKeyboardBuilder()
+    seen = set()
+    for row in db.list_workspaces():
+        chat_id = int(row["chat_id"])
+        thread_id = int(row["thread_id"]) if row["thread_id"] is not None else 0
+        key = (chat_id, thread_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        kb.button(text=group_scope_label(chat_id, None if thread_id == 0 else thread_id), callback_data=f"admin:group_stats_item:{chat_id}:{thread_id}")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def render_group_stats_for_scope(chat_id: int, thread_id: Optional[int]) -> str:
+    totals = db.group_stats(chat_id, thread_id)
+    per_operator = db.conn.execute(
+        """
+        SELECT operator_key,
+               COUNT(*) AS total,
+               SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
+               SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
+               SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+        FROM queue_items
+        WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?)
+        GROUP BY operator_key
+        ORDER BY total DESC, operator_key ASC
+        """,
+        (chat_id, thread_id, thread_id),
+    ).fetchall()
+    per_taker = db.conn.execute(
+        """
+        SELECT taken_by_admin AS taker_user_id,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total,
+               SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+        FROM queue_items
+        WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?) AND taken_by_admin IS NOT NULL
+        GROUP BY taken_by_admin
+        ORDER BY total DESC
+        """,
+        (chat_id, thread_id, thread_id),
+    ).fetchall()
+    op_lines = []
+    for row in per_operator:
+        op_lines.append(
+            f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
+            f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
+            f"💰 <b>{usd(row['paid_total'] or 0)}</b>"
+        )
+    if not op_lines:
+        op_lines = ["• Пока пусто"]
+    taker_lines = []
+    for row in per_taker:
+        uid = int(row["taker_user_id"])
+        user = db.get_user(uid)
+        name = escape(user["full_name"]) if user and user["full_name"] else str(uid)
+        taker_lines.append(
+            f"• <b>{name}</b> — взял: {int(row['total'] or 0)}, успешно: {int(row['completed_total'] or 0)}, оплат: <b>{usd(row['paid_total'] or 0)}</b>"
+        )
+    if not taker_lines:
+        taker_lines = ["• Пока никто не брал номера"]
+    return (
+        "<b>📈 Стата группы / топика</b>\n\n"
+        f"🏷 <b>Зона:</b> {group_scope_label(chat_id, thread_id)}\n\n"
+        f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>\n"
         f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>\n"
         f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>\n"
         f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>\n"
@@ -3247,20 +3331,20 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     if action == "stats":
         await state.clear()
         await state.set_state(AdminStates.waiting_user_stats_lookup)
-        await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>")
+        await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>", reply_markup=cancel_flow_kb("admin:user_tools"))
         await callback.answer()
         return
 
     if action == "set_price":
         await state.clear()
         await state.set_state(AdminStates.waiting_user_price_lookup)
-        await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя для персонального прайса:</b>")
+        await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя для персонального прайса:</b>", reply_markup=cancel_flow_kb("admin:user_tools"))
         await callback.answer()
         return
 
     await state.update_data(user_action=action)
     await state.set_state(AdminStates.waiting_user_action_id)
-    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>")
+    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>", reply_markup=cancel_flow_kb("admin:user_tools"))
     await callback.answer()
 
 @router.message(AdminStates.waiting_user_stats_lookup)
@@ -3303,13 +3387,13 @@ async def admin_user_price_lookup(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
         return
-    user = resolve_user_input(message.text)
+    lookup_source = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else message.text
+    user = resolve_user_input(lookup_source)
     if not user:
-        await message.answer("Пользователь не найден. Проверьте ID / @username / номер.")
+        await message.answer("Пользователь не найден. Отправьте ID / @username / номер ещё раз или нажмите отмену.", reply_markup=cancel_flow_kb("admin:user_tools"))
         return
     uid = int(user["user_id"])
     await state.update_data(target_user_id=uid)
-    await state.clear()
     await message.answer(
         "<b>✅ Пользователь найден</b>\n\n"
         f"👤 <b>{escape(user['full_name'] or '')}</b>\n"
@@ -3320,18 +3404,20 @@ async def admin_user_price_lookup(message: Message, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("admin:user_price_back_ops:"))
-async def admin_user_price_back_ops(callback: CallbackQuery):
+async def admin_user_price_back_ops(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     uid = int(callback.data.split(":")[-1])
+    await state.update_data(target_user_id=uid)
     await safe_edit_or_send(callback, "<b>Выберите оператора:</b>", reply_markup=user_price_operator_kb(uid))
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:user_price_op:"))
-async def admin_user_price_op(callback: CallbackQuery):
+async def admin_user_price_op(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     _, _, _, uid, operator_key = callback.data.split(":")
+    await state.update_data(target_user_id=int(uid), operator_key=operator_key)
     await safe_edit_or_send(
         callback,
         f"<b>Пользователь:</b> <code>{uid}</code>\n<b>Оператор:</b> {op_text(operator_key)}\n\n<b>Выберите режим:</b>",
@@ -3346,13 +3432,17 @@ async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
     _, _, _, uid, operator_key, mode = callback.data.split(":")
     await state.set_state(AdminStates.waiting_user_custom_price_text)
     await state.update_data(target_user_id=int(uid), operator_key=operator_key, price_mode=mode)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data="admin:user_tools")
+    kb.button(text="↩️ Назад к операторам", callback_data=f"admin:user_price_back_ops:{uid}")
+    kb.adjust(1)
     await safe_edit_or_send(
         callback,
         f"<b>Пользователь:</b> <code>{uid}</code>\n"
         f"<b>Оператор:</b> {op_text(operator_key)}\n"
         f"<b>Режим:</b> {mode_label(mode)}\n\n"
         "Введите сумму числом или <code>reset</code> для удаления:",
-        reply_markup=admin_back_kb("admin:user_tools"),
+        reply_markup=kb.as_markup(),
     )
     await callback.answer()
 
@@ -3365,7 +3455,8 @@ async def admin_user_custom_price_text(message: Message, state: FSMContext):
     uid = int(data["target_user_id"])
     operator_key = data["operator_key"]
     mode = data["price_mode"]
-    value_raw = (message.text or "").strip().lower()
+    value_source = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else message.text
+    value_raw = (value_source or "").strip().lower()
 
     if value_raw in {"reset", "delete", "del", "none"}:
         db.delete_user_price(uid, operator_key, mode)
@@ -3381,7 +3472,7 @@ async def admin_user_custom_price_text(message: Message, state: FSMContext):
     try:
         value = float(value_raw.replace(",", "."))
     except Exception:
-        await message.answer("Введите сумму числом или <code>reset</code>.")
+        await message.answer("Введите сумму числом или <code>reset</code>.", reply_markup=cancel_flow_kb("admin:user_tools"))
         return
 
     db.set_user_price(uid, operator_key, mode, value)
@@ -3394,6 +3485,7 @@ async def admin_user_custom_price_text(message: Message, state: FSMContext):
         f"💰 Цена: <b>{usd(value)}</b>"
     )
 
+@router.message(AdminStates.waiting_user_action_text)
 @router.message(AdminStates.waiting_user_action_text)
 async def admin_user_action_text(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -3479,6 +3571,20 @@ async def db_upload_wrong(message: Message):
 
 
 @router.message(Command("stata"))
+@router.message(Command("Stata"))
+async def group_stata(message: Message):
+    if user_role(message.from_user.id) not in {"chief_admin", "admin", "operator"}:
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Статистику групп смотрите через кнопку <b>📈 Стата групп</b> в /admin.")
+        return
+    try:
+        chat_id = message.chat.id
+        thread_id = getattr(message, "message_thread_id", None)
+        await message.answer(render_group_stats_for_scope(chat_id, thread_id))
+    except Exception:
+        await message.answer("⚠️ Не удалось собрать статистику для этой группы / топика.")
+
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
     if user_role(message.from_user.id) not in {"chief_admin", "admin", "operator"}:
