@@ -82,13 +82,15 @@ class WithdrawStates(StatesGroup):
 class EmojiLookupStates(StatesGroup):
     waiting_target = State()
 
-
+class MirrorStates(StatesGroup):
+    waiting_token = State()
 
 class AdminStates(StatesGroup):
     waiting_hold = State()
     waiting_min_withdraw = State()
     waiting_treasury_add = State()
     waiting_treasury_sub = State()
+    waiting_treasury_invoice = State()
     waiting_operator_price = State()
     waiting_role_user = State()
     waiting_role_kind = State()
@@ -205,6 +207,21 @@ class Database:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS mirrors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                token TEXT NOT NULL UNIQUE,
+                bot_id INTEGER,
+                bot_username TEXT,
+                bot_first_name TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -223,6 +240,21 @@ class Database:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS treasury_invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                amount REAL NOT NULL,
+                crypto_invoice_id TEXT,
+                pay_url TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                paid_at TEXT
             )
             """
         )
@@ -475,6 +507,26 @@ class Database:
         row = self.conn.execute("SELECT COUNT(*) AS c FROM withdrawals WHERE status='pending'").fetchone()
         return int(row["c"] or 0)
 
+
+    def create_treasury_invoice(self, amount: float, crypto_invoice_id: Optional[str], pay_url: Optional[str], created_by: int):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO treasury_invoices (amount, crypto_invoice_id, pay_url, status, created_by, created_at) VALUES (?, ?, ?, 'active', ?, ?)",
+            (amount, str(crypto_invoice_id or ''), pay_url or '', created_by, now_str()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_treasury_invoice(self, invoice_id: int):
+        return self.conn.execute("SELECT * FROM treasury_invoices WHERE id = ?", (invoice_id,)).fetchone()
+
+    def mark_treasury_invoice_paid(self, invoice_id: int):
+        self.conn.execute("UPDATE treasury_invoices SET status='paid', paid_at=? WHERE id=?", (now_str(), invoice_id))
+        self.conn.commit()
+
+    def list_recent_treasury_invoices(self, limit: int = 10):
+        return self.conn.execute("SELECT * FROM treasury_invoices ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     def get_treasury(self) -> float:
         return float(self.get_setting("treasury_balance", str(DEFAULT_TREASURY_BALANCE)))
 
@@ -623,6 +675,7 @@ def main_menu():
     kb.button(text="📦 Мои номера", callback_data="menu:my")
     kb.button(text="👤 Профиль", callback_data="menu:profile")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
+    kb.button(text="🪞 Зеркало", callback_data="menu:mirror")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -643,6 +696,23 @@ def cancel_inline_kb(back: str = "menu:home"):
     kb.button(text="❌ Отмена", callback_data=back)
     kb.adjust(1)
     return kb.as_markup()
+
+
+def submit_success_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Сдать ещё номер", callback_data="menu:submit")
+    kb.button(text="🏠 Главное меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def mirror_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Создать зеркало", callback_data="mirror:create")
+    kb.button(text="📋 Мои зеркала", callback_data="mirror:list")
+    kb.button(text="🏠 Главное меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
 
 
 def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:back"):
@@ -742,10 +812,11 @@ def admin_back_kb(target: str = "admin:home"):
 
 def treasury_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Пополнить", callback_data="admin:treasury_add")
-    kb.button(text="➖ Списать", callback_data="admin:treasury_sub")
+    kb.button(text="➕ Пополнить через Crypto Bot", callback_data="admin:treasury_add")
+    kb.button(text="🔄 Проверить оплату", callback_data="admin:treasury_check")
+    kb.button(text="➖ Вывести казну чеком", callback_data="admin:treasury_sub")
     kb.button(text="↩️ Назад", callback_data="admin:home")
-    kb.adjust(2, 1)
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -971,13 +1042,37 @@ def render_my_numbers(user_id: int) -> str:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
             rows.append(
-                f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])} • <b>{row['status']}</b>{pos_text}"
+                f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • "
+                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{pos_text}"
             )
         body = "\n".join(rows)
     return (
         "<b>📦 Мои номера — сегодня</b>\n\n"
         + quote_block([body])
         + "\n\n<i>Здесь можно посмотреть свои заявки за день и убрать из очереди те, что ещё не взяты в работу.</i>"
+    )
+
+
+
+def render_mirror_menu(user_id: int) -> str:
+    rows = db.list_mirrors(user_id)
+    if not rows:
+        body = "• У вас пока нет зеркал."
+    else:
+        body = "\n".join(
+            f"• @{escape(row['bot_username'] or 'unknown_bot')} — <b>{escape(row['status'])}</b>"
+            for row in rows[:10]
+        )
+    return (
+        "<b>🪞 Зеркало бота</b>\n\n"
+        "Здесь можно подключить <b>токен другого Telegram-бота</b>, и он будет работать как зеркало этого сервиса: "
+        "те же очереди, те же заявки, та же база, но <b>без дополнительных прав</b>.\n\n"
+        "<b>Как создать:</b>\n"
+        "1. Создайте бота у <b>@BotFather</b>\n"
+        "2. Получите API Token\n"
+        "3. Нажмите <b>Создать зеркало</b> и отправьте токен\n\n"
+        "<b>Ваши зеркала:</b>\n"
+        + body
     )
 
 def render_admin_home() -> str:
@@ -1001,7 +1096,13 @@ def render_admin_summary() -> str:
 
 
 def render_admin_treasury() -> str:
-    return f"<b>🏦 Казна</b>\n\n💰 Баланс казны: <b>{usd(db.get_treasury())}</b>"
+    recent = db.list_recent_treasury_invoices(5)
+    extra = ""
+    if recent:
+        extra = "\n\n<b>Последние инвойсы:</b>\n" + "\n".join(
+            f"• #{row['id']} — {usd(row['amount'])} — <b>{row['status']}</b>" for row in recent
+        )
+    return f"<b>🏦 Казна</b>\n\n💰 Баланс казны: <b>{usd(db.get_treasury())}</b>{extra}"
 
 
 def render_admin_withdraws() -> str:
@@ -1092,6 +1193,31 @@ def mode_label(mode: str) -> str:
 
 def mode_emoji(mode: str) -> str:
     return "⏳" if mode == "hold" else "⚡"
+
+
+def status_label(status: str, fail_reason: Optional[str] = None) -> str:
+    if status == "queued":
+        return "В очереди"
+    if status == "taken":
+        return "Взято"
+    if status == "in_progress":
+        return "На холде" if fail_reason != "instant" else "В работе"
+    if status == "completed":
+        return "Успешно"
+    if status == "failed":
+        if fail_reason and "error" in str(fail_reason):
+            return "Ошибка"
+        if fail_reason == "slip":
+            return "Слет"
+        if fail_reason == "admin_removed":
+            return "Удалено админом"
+        if fail_reason == "user_removed":
+            return "Удалено пользователем"
+        return "Неуспешно"
+    return status
+
+def status_label_from_row(row) -> str:
+    return status_label(row["status"], row["fail_reason"] if "fail_reason" in row.keys() else None)
 
 
 def msk_day_window() -> tuple[str, str]:
@@ -1355,6 +1481,44 @@ def resolve_user_input(raw: str):
     return db.find_last_user_by_phone(raw)
 
 
+
+async def create_crypto_invoice(amount: float, description: str = "Treasury top up") -> tuple[Optional[str], Optional[str], str]:
+    if not CRYPTO_PAY_TOKEN:
+        return None, None, "CRYPTO_PAY_TOKEN не заполнен."
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+    payload = {
+        "asset": CRYPTO_PAY_ASSET,
+        "amount": f"{amount:.2f}",
+        "description": description[:1024],
+        "allow_anonymous": True,
+        "allow_comments": False,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{CRYPTO_PAY_BASE_URL}/createInvoice", json=payload, headers=headers, timeout=20) as resp:
+                data = await resp.json(content_type=None)
+        if not data.get("ok"):
+            return None, None, f"Crypto Pay API error: {data.get('error', 'unknown_error')}"
+        result = data.get("result", {})
+        return str(result.get("invoice_id") or ""), result.get("pay_url") or result.get("bot_invoice_url"), "Инвойс создан."
+    except Exception as e:
+        return None, None, f"Ошибка создания инвойса: {e}"
+
+async def get_crypto_invoice(invoice_id: str) -> tuple[Optional[dict], str]:
+    if not CRYPTO_PAY_TOKEN:
+        return None, "CRYPTO_PAY_TOKEN не заполнен."
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{CRYPTO_PAY_BASE_URL}/getInvoices", params={"invoice_ids": str(invoice_id)}, headers=headers, timeout=20) as resp:
+                data = await resp.json(content_type=None)
+        if not data.get("ok"):
+            return None, f"Crypto Pay API error: {data.get('error', 'unknown_error')}"
+        items = data.get("result", {}).get("items", [])
+        return (items[0] if items else None), "ok"
+    except Exception as e:
+        return None, f"Ошибка проверки инвойса: {e}"
+
 async def create_crypto_check(amount: float, user_id: Optional[int] = None) -> tuple[Optional[int], Optional[str], str]:
     if not CRYPTO_PAY_TOKEN:
         return None, None, "CRYPTO_PAY_TOKEN не заполнен, поэтому выдана ручная заявка вместо чека."
@@ -1411,6 +1575,67 @@ async def menu_home(callback: CallbackQuery, state: FSMContext):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
     await callback.answer()
 
+
+
+
+@router.callback_query(F.data == "menu:mirror")
+async def mirror_menu(callback: CallbackQuery, state: FSMContext):
+    touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
+    await state.clear()
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_mirror_menu(callback.from_user.id), mirror_menu_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "mirror:list")
+async def mirror_list(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_mirror_menu(callback.from_user.id), mirror_menu_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "mirror:create")
+async def mirror_create(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MirrorStates.waiting_token)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="menu:mirror")
+    kb.adjust(1)
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        "<b>🪞 Создание зеркала</b>\n\nОтправьте <b>API Token</b> вашего Telegram-бота от <b>@BotFather</b>.\n\n"
+        "После проверки бот попытается сразу запустить зеркало внутри этого же сервиса.",
+        kb.as_markup(),
+    )
+    await callback.answer()
+
+@router.message(MirrorStates.waiting_token)
+async def mirror_token_input(message: Message, state: FSMContext):
+    token = (message.text or "").strip()
+    if ":" not in token:
+        await message.answer("⚠️ Похоже, это не токен бота. Отправьте токен в формате <code>123456:ABC...</code>")
+        return
+    if token == BOT_TOKEN:
+        await message.answer("⚠️ Это токен основного бота.")
+        return
+    existing = db.get_mirror_by_token(token)
+    if existing:
+        await state.clear()
+        ensure_mirror_task(token, existing["bot_username"] or "mirror")
+        await message.answer(f"✅ Зеркало уже было добавлено: <b>@{escape(existing['bot_username'])}</b>", reply_markup=main_menu())
+        return
+    me, err = await validate_bot_token(token)
+    if err or not me:
+        await message.answer(f"❌ Не удалось проверить токен: <code>{escape(err or 'unknown error')}</code>")
+        return
+    db.add_mirror(message.from_user.id, token, int(me.id), me.username or "", me.first_name or "")
+    started = ensure_mirror_task(token, me.username or "mirror")
+    await state.clear()
+    await message.answer(
+        "<b>✅ Зеркало подключено</b>\n\n"
+        f"🤖 Бот: <b>@{escape(me.username or '')}</b>\n"
+        f"🆔 ID: <code>{me.id}</code>\n"
+        f"🚀 Статус запуска: <b>{'запущено' if started else 'уже активно'}</b>\n\n"
+        "Теперь через этого бота тоже можно сдавать номера и пользоваться тем же сервисом.",
+        reply_markup=submit_success_kb(),
+    )
 
 @router.callback_query(F.data == "menu:profile")
 async def profile_cb(callback: CallbackQuery, state: FSMContext):
@@ -1652,13 +1877,79 @@ async def withdraw_confirm(callback: CallbackQuery):
         f"💸 Сумма: <b>{usd(amount)}</b>"
     )
     try:
-        await callback.bot.send_message(WITHDRAW_CHANNEL_ID, text, reply_markup=withdraw_admin_kb(wd_id))
+        await callback.bot.send_message(int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID))), text, reply_markup=withdraw_admin_kb(wd_id))
     except Exception:
         logging.exception("send withdraw to channel failed")
-    await callback.message.edit_text("✅ Заявка на вывод создана и отправлена на проверку.")
+    await callback.message.edit_text("✅ Заявка на вывод создана. Она отправлена в канал выплат и может быть одобрена или отклонена администратором.")
     await send_banner_message(callback.message, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
     await callback.answer()
 
+
+@router.callback_query(F.data.startswith("wd_ok:"))
+async def wd_ok(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+    amount = float(wd["amount"])
+    if amount > db.get_treasury():
+        await callback.answer("⚠️ В казне недостаточно средств для создания чека.", show_alert=True)
+        return
+    check_id, check_url, status_msg = await create_crypto_check(amount, int(wd["user_id"]))
+    if not check_id or not check_url:
+        await callback.answer(status_msg, show_alert=True)
+        return
+    db.subtract_treasury(amount)
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, str(check_url), f"check_id={check_id}")
+    try:
+        await callback.bot.send_message(
+            int(wd["user_id"]),
+            "<b>✅ Заявка на вывод одобрена</b>\n\n"
+            f"💸 Сумма: <b>{usd(amount)}</b>\n"
+            f"🎟 Чек выплаты:\n{check_url}"
+        )
+    except Exception:
+        logging.exception("send withdraw approved failed")
+    await callback.message.edit_text(
+        "<b>✅ Заявка на вывод одобрена</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(amount)}</b>\n"
+        f"🎟 Чек: {check_url}\n"
+        f"🏦 Остаток казны: <b>{usd(db.get_treasury())}</b>"
+    )
+    await callback.answer("Чек создан")
+
+@router.callback_query(F.data.startswith("wd_no:"))
+async def wd_no(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+    db.add_balance(int(wd["user_id"]), float(wd["amount"]))
+    db.set_withdrawal_status(withdraw_id, "rejected", callback.from_user.id, None, "rejected")
+    try:
+        await callback.bot.send_message(
+            int(wd["user_id"]),
+            "<b>❌ Заявка на вывод отклонена</b>\n\n"
+            f"💸 Сумма возвращена на баланс: <b>{usd(float(wd['amount']))}</b>"
+        )
+    except Exception:
+        logging.exception("send withdraw rejected failed")
+    await callback.message.edit_text(
+        "<b>❌ Заявка на вывод отклонена</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+        "Деньги возвращены на баланс пользователя."
+    )
+    await callback.answer("Отклонено")
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -1692,6 +1983,26 @@ async def admin_treasury(callback: CallbackQuery):
     await callback.message.edit_text(render_admin_treasury(), reply_markup=treasury_kb())
     await callback.answer()
 
+
+
+@router.callback_query(F.data == "admin:treasury_check")
+async def admin_treasury_check(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    added = 0.0
+    for row in db.list_recent_treasury_invoices(10):
+        if row["status"] != "active" or not row["crypto_invoice_id"]:
+            continue
+        info, _ = await get_crypto_invoice(row["crypto_invoice_id"])
+        if info and str(info.get("status", "")).lower() == "paid":
+            db.mark_treasury_invoice_paid(int(row["id"]))
+            db.add_treasury(float(row["amount"]))
+            added += float(row["amount"])
+    await callback.message.edit_text(
+        render_admin_treasury() + (f"\n\n✅ Подтверждено пополнений: <b>{usd(added)}</b>" if added else "\n\nПлатежей пока не найдено."),
+        reply_markup=treasury_kb()
+    )
+    await callback.answer()
 
 @router.callback_query(F.data == "admin:withdraws")
 async def admin_withdraws(callback: CallbackQuery):
@@ -1781,7 +2092,7 @@ async def admin_broadcast_preview(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     ad = db.get_setting("broadcast_text", "").strip()
-    await callback.message.answer(ad or "Объявление пока пустое.")
+    await callback.message.answer(ad or "Рассылка пока пустая.")
     await callback.answer()
 
 
@@ -1791,7 +2102,7 @@ async def admin_broadcast_send_ad(callback: CallbackQuery):
         return
     ad = db.get_setting("broadcast_text", "").strip()
     if not ad:
-        await callback.answer("Сначала сохрани объявление", show_alert=True)
+        await callback.answer("Сначала сохрани рассылку", show_alert=True)
         return
     sent = 0
     for uid in db.all_user_ids():
@@ -1858,8 +2169,8 @@ async def admin_set_min_withdraw(callback: CallbackQuery, state: FSMContext):
 async def admin_treasury_add(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await state.set_state(AdminStates.waiting_treasury_add)
-    await callback.message.answer("Введите сумму пополнения казны в $:")
+    await state.set_state(AdminStates.waiting_treasury_invoice)
+    await callback.message.answer("Введите сумму пополнения казны в $ для создания <b>Crypto Bot invoice</b>:")
     await callback.answer()
 
 
@@ -1868,7 +2179,7 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.set_state(AdminStates.waiting_treasury_sub)
-    await callback.message.answer("Введите сумму списания казны в $:")
+    await callback.message.answer("Введите сумму вывода казны в $ — будет создан <b>реальный чек Crypto Bot</b>:")
     await callback.answer()
 
 
@@ -1941,7 +2252,7 @@ async def admin_min_withdraw_value(message: Message, state: FSMContext):
     await message.answer("✅ Минимальный вывод обновлён.")
 
 
-@router.message(AdminStates.waiting_treasury_add)
+@router.message(AdminStates.waiting_treasury_invoice)
 async def admin_treasury_add_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
@@ -1950,9 +2261,19 @@ async def admin_treasury_add_value(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Введите число.")
         return
-    db.add_treasury(value)
+    invoice_id, pay_url, status_msg = await create_crypto_invoice(value, "Treasury top up")
+    if not invoice_id or not pay_url:
+        await message.answer(f"❌ {status_msg}")
+        return
+    local_id = db.create_treasury_invoice(value, invoice_id, pay_url, message.from_user.id)
     await state.clear()
-    await message.answer(f"✅ Казна пополнена. Сейчас: {usd(db.get_treasury())}")
+    await message.answer(
+        "<b>✅ Инвойс на пополнение казны создан</b>\n\n"
+        f"🧾 Локальный ID: <b>#{local_id}</b>\n"
+        f"💸 Сумма: <b>{usd(value)}</b>\n"
+        f"🔗 Ссылка на оплату:\n{pay_url}\n\n"
+        "После оплаты зайдите в казну и нажмите <b>Проверить оплату</b>."
+    )
 
 
 @router.message(AdminStates.waiting_treasury_sub)
@@ -1967,9 +2288,18 @@ async def admin_treasury_sub_value(message: Message, state: FSMContext):
     if value > db.get_treasury():
         await message.answer("⚠️ В казне недостаточно средств.")
         return
+    check_id, check_url, status_msg = await create_crypto_check(value)
+    if not check_id or not check_url:
+        await message.answer(f"❌ {status_msg}")
+        return
     db.subtract_treasury(value)
     await state.clear()
-    await message.answer(f"✅ Средства списаны. Сейчас: {usd(db.get_treasury())}")
+    await message.answer(
+        "<b>✅ Вывод казны создан</b>\n\n"
+        f"💸 Сумма: <b>{usd(value)}</b>\n"
+        f"🎟 Чек: {check_url}\n"
+        f"💰 Остаток казны: <b>{usd(db.get_treasury())}</b>"
+    )
 
 
 @router.message(AdminStates.waiting_operator_price)
@@ -2036,7 +2366,7 @@ async def admin_start_text_value(message: Message, state: FSMContext):
 async def admin_ad_text_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    db.set_setting("announcement_text", message.html_text or (message.text or ""))
+    db.set_setting("broadcast_text", message.html_text or (message.text or ""))
     await state.clear()
     await message.answer("✅ Объявление сохранено.")
 
@@ -2045,9 +2375,9 @@ async def admin_ad_text_value(message: Message, state: FSMContext):
 async def admin_broadcast_text_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    db.set_setting("announcement_text", message.html_text or (message.text or ""))
+    db.set_setting("broadcast_text", message.html_text or (message.text or ""))
     await state.clear()
-    await message.answer("✅ Текст сохранён как активное объявление. Теперь его можно разослать из /admin.")
+    await message.answer("✅ Текст сохранён как активная рассылка. Теперь его можно превьюнуть и разослать из /admin.")
 
 
 @router.message(Command("work"))
@@ -2252,6 +2582,35 @@ async def track_any_message(message: Message):
         touch_user(message.from_user.id, message.from_user.username or '', message.from_user.full_name)
 
 
+
+
+MIRROR_TASKS: dict[str, asyncio.Task] = {}
+
+async def validate_bot_token(token: str):
+    try:
+        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        me = await bot.get_me()
+        await bot.session.close()
+        return me, None
+    except Exception as e:
+        return None, str(e)
+
+async def run_single_bot(token: str, label: str = "mirror"):
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp_local = Dispatcher(storage=MemoryStorage())
+    dp_local.include_router(router)
+    me = await bot.get_me()
+    logging.info("Mirror bot started as @%s", me.username or label)
+    try:
+        await dp_local.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+def ensure_mirror_task(token: str, label: str = "mirror"):
+    if token in MIRROR_TASKS and not MIRROR_TASKS[token].done():
+        return False
+    MIRROR_TASKS[token] = asyncio.create_task(run_single_bot(token, label))
+    return True
 
 async def hold_watcher(bot: Bot):
     while True:
@@ -2742,6 +3101,12 @@ async def main():
     asyncio.create_task(hold_watcher(bot))
     me = await bot.get_me()
     logging.info("Bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
+
+    for mirror in db.all_active_mirrors():
+        token = mirror["token"]
+        if token and token != BOT_TOKEN:
+            ensure_mirror_task(token, mirror["bot_username"] or "mirror")
+
     await dp.start_polling(bot)
 
 
