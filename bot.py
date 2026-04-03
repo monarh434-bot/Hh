@@ -927,6 +927,12 @@ def withdraw_admin_kb(withdraw_id: int):
     kb.adjust(2)
     return kb.as_markup()
 
+def withdraw_paid_kb(withdraw_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💸 Оплачено", callback_data=f"wd_paid:{withdraw_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
 
 def admin_root_kb():
     kb = InlineKeyboardBuilder()
@@ -1859,6 +1865,7 @@ def resolve_user_input(raw: str):
         user = db.find_last_user_by_phone(cleaned)
         if user:
             return user
+
         variants = []
         if cleaned.startswith("8") and len(cleaned) == 11:
             variants += ["7" + cleaned[1:], "+" + "7" + cleaned[1:]]
@@ -1866,24 +1873,11 @@ def resolve_user_input(raw: str):
             variants += ["8" + cleaned[1:], "+" + cleaned]
         else:
             variants += ["+" + cleaned]
+
         for v in variants:
             user = db.find_last_user_by_phone(v)
             if user:
                 return user
-
-        user = db.conn.execute(
-            """
-            SELECT u.*
-            FROM users u
-            JOIN queue_items q ON q.user_id = u.user_id
-            WHERE q.phone_number LIKE ? OR q.normalized_phone LIKE ?
-            ORDER BY q.id DESC
-            LIMIT 1
-            """,
-            (f"%{raw}%", f"%{cleaned}%"),
-        ).fetchone()
-        if user:
-            return user
 
     return None
 
@@ -2343,24 +2337,54 @@ async def wd_ok(callback: CallbackQuery):
     if not wd or wd["status"] != "pending":
         await callback.answer("Заявка уже обработана.", show_alert=True)
         return
-    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, None, "manual_payout")
-    try:
-        await callback.bot.send_message(
-            int(wd["user_id"]),
-            "<b>✅ Заявка на вывод одобрена</b>\n\n"
-            f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
-            "Ожидайте оплату на ваш привязанный счёт CryptoBot."
-        )
-    except Exception:
-        logging.exception("send withdraw approved failed")
+
+    payout_link = db.get_payout_link(int(wd["user_id"])) or "—"
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, payout_link, "approved_waiting_payment")
+
     await callback.message.edit_text(
         "<b>✅ Заявка на вывод одобрена</b>\n\n"
         f"🧾 ID: <b>{withdraw_id}</b>\n"
         f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
-        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
-        "Статус: <b>ожидает ручной оплаты администратором</b>"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}\n\n"
+        "Статус: <b>Ожидает оплаты</b>",
+        reply_markup=withdraw_paid_kb(withdraw_id),
     )
     await callback.answer("Одобрено")
+
+@router.callback_query(F.data.startswith("wd_paid:"))
+async def wd_paid(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] not in {"pending", "approved"}:
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    payout_link = db.get_payout_link(int(wd["user_id"])) or (wd["payout_check"] if "payout_check" in wd.keys() else "—")
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, payout_link, "paid")
+
+    try:
+        await callback.bot.send_message(
+            int(wd["user_id"]),
+            "<b>✅ Выплата отправлена</b>\n\n"
+            f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+            "Статус: <b>Оплачено</b>\n\n"
+            "Средства отправлены на ваш привязанный счёт CryptoBot."
+        )
+    except Exception:
+        logging.exception("send withdraw paid notify failed")
+
+    await callback.message.edit_text(
+        "<b>✅ Заявка на вывод обработана</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}\n\n"
+        "Статус: <b>Оплачено</b>"
+    )
+    await callback.answer("Оплачено")
 
 @router.callback_query(F.data.startswith("wd_no:"))
 async def wd_no(callback: CallbackQuery):
@@ -3311,7 +3335,6 @@ async def admin_user_price_lookup(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # If admin typed another identifier here, resolve again.
     raw = (message.text or "").strip()
     if raw:
         user = resolve_user_input(raw)
@@ -3328,32 +3351,32 @@ async def admin_user_price_lookup(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("admin:user_price_op:"))
 async def admin_user_price_op(callback: CallbackQuery):
+    logging.info("admin_user_price_op callback=%s", callback.data)
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, uid, operator_key = callback.data.split(":")
-    await safe_edit_or_send(
-        callback,
+    await callback.answer()
+    _, _, uid, operator_key = callback.data.split(":")
+    await callback.message.answer(
         f"<b>Пользователь:</b> <code>{uid}</code>\n<b>Оператор:</b> {op_text(operator_key)}\n\n<b>Выберите режим:</b>",
         reply_markup=user_price_mode_kb(int(uid), operator_key),
     )
-    await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:user_price_mode:"))
 async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
+    logging.info("admin_user_price_mode callback=%s", callback.data)
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, uid, operator_key, mode = callback.data.split(":")
+    await callback.answer()
+    _, _, uid, operator_key, mode = callback.data.split(":")
     await state.set_state(AdminStates.waiting_user_price_value)
     await state.update_data(target_user_id=int(uid), operator_key=operator_key, price_mode=mode)
-    await safe_edit_or_send(
-        callback,
+    await callback.message.answer(
         f"<b>Пользователь:</b> <code>{uid}</code>\n"
         f"<b>Оператор:</b> {op_text(operator_key)}\n"
         f"<b>Режим:</b> {mode_label(mode)}\n\n"
         "Введите сумму числом или <code>reset</code> для удаления:",
         reply_markup=admin_back_kb("admin:user_tools"),
     )
-    await callback.answer()
 
 @router.message(AdminStates.waiting_user_price_value)
 async def admin_user_price_value(message: Message, state: FSMContext):
