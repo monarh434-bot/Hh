@@ -1184,12 +1184,12 @@ def render_start(user_id: int) -> str:
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
     description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
     price_lines = [
-        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
-        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
-        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
-        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
-        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold'))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold'))}</b>",
-        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold'))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold'))}</b>",
+        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mts', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold', user_id))}</b> / <b>{usd(get_mode_price('bil', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mega', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold', user_id))}</b> / <b>{usd(get_mode_price('t2', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold', user_id))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold', user_id))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold', user_id))}</b>",
     ]
     queue_lines = [
         f"{op_emoji_html('mts')} <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
@@ -1201,20 +1201,17 @@ def render_start(user_id: int) -> str:
     ]
     return (
         f"<b>💫 {title} 💫</b>\n"
-        f"<i>{subtitle}</i>\n\n"
+        f"{subtitle}\n\n"
         f"{description}\n\n"
-        "━━━━━━━━━━━━━━\n"
         f"🔗 <b>Username:</b> {username}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-        f"💰 <b>Баланс:</b> <b>{balance}</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "<b>💎 Прайсы (Холд / БезХолд):</b>\n"
-        + quote_block(price_lines) + "\n\n"
-        + "<b>📤 Очереди (Холд / БезХолд):</b>\n"
-        + quote_block(queue_lines) + "\n\n"
-        + "<i>Вы находитесь в главном меню.</i>\n👇 <b>Выберите нужное действие ниже:</b>"
+        f"💰 <b>Баланс:</b> <b>{balance}</b>\n\n"
+        f"<b>💎 Прайсы:</b>\n"
+        + quote_block(price_lines)
+        + "\n\n<b>📤 Очереди:</b>\n"
+        + quote_block(queue_lines)
+        + "\n\n<b>Вы находитесь в главном меню.</b>\n👇 <b>Выберите нужное действие ниже:</b>"
     )
-
 
 def render_profile(user_id: int) -> str:
     user = db.get_user(user_id)
@@ -1229,6 +1226,14 @@ def render_profile(user_id: int) -> str:
         f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
         for row in ops
     ) or "• <i>Пока пусто</i>"
+    personal_price_lines = [
+        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mts', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold', user_id))}</b> / <b>{usd(get_mode_price('bil', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mega', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold', user_id))}</b> / <b>{usd(get_mode_price('t2', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold', user_id))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold', user_id))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold', user_id))}</b>",
+    ]
     return (
         "<b>👤 Личный кабинет - ESIM Service X 💫</b>\n\n"
         + quote_block([
@@ -1238,6 +1243,8 @@ def render_profile(user_id: int) -> str:
             f"💲 <b>Баланс:</b> <b>{usd(user['balance'] if user else 0)}</b>",
             f"💳 <b>Счёт CryptoBot:</b> {payout_status}",
         ])
+        + "\n\n<b>💎 Ваши прайсы</b>\n"
+        + quote_block(personal_price_lines)
         + "\n\n<b>📊 Ваша статистика:</b>\n"
         + quote_block([
             f"🧾 <b>Всего заявок:</b> {int(stats['total'] or 0)}",
@@ -1450,6 +1457,23 @@ def render_operator_modes() -> str:
         nh_status = "✅" if is_operator_mode_enabled(key, "no_hold") else "🚫"
         lines.append(f"{op_text(key)}\n• Холд: {hold_status}\n• БезХолд: {nh_status}")
     return "<b>🎛 Приём номеров по операторам</b>\n\n" + "\n\n".join(lines)
+
+def hold_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Изменить время Холд", callback_data="admin:set_hold")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def prices_kb():
+    kb = InlineKeyboardBuilder()
+    for mode in ("hold", "no_hold"):
+        mode_label_text = "⏳ Холд" if mode == "hold" else "⚡ БезХолд"
+        for key in OPERATORS:
+            kb.button(text=f"{mode_label_text} • {op_text(key)}", callback_data=f"admin:set_price:{mode}:{key}")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
 
 def settings_kb():
     kb = InlineKeyboardBuilder()
@@ -2487,7 +2511,7 @@ async def admin_withdraws(callback: CallbackQuery):
 async def admin_hold(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_admin_hold(), reply_markup=hold_kb())
+    await safe_edit_or_send(callback, render_admin_hold(), reply_markup=hold_kb())
     await callback.answer()
 
 
@@ -2495,7 +2519,7 @@ async def admin_hold(callback: CallbackQuery):
 async def admin_prices(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_admin_prices(), reply_markup=prices_kb())
+    await safe_edit_or_send(callback, render_admin_prices(), reply_markup=prices_kb())
     await callback.answer()
 
 
@@ -3060,7 +3084,7 @@ async def esim_choose_mode(callback: CallbackQuery):
         return
     mode = callback.data.split(':', 1)[1]
     text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:\n<i>Цена указана прямо в кнопках.</i>"
-    await safe_edit_or_send(callback, text, reply_markup=operators_kb(mode, 'esim_take', 'esim:back_mode'))
+    await safe_edit_or_send(callback, text, reply_markup=operators_kb(mode, 'esim_take', 'esim:back_mode', callback.from_user.id))
     await callback.answer()
 
 
