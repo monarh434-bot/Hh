@@ -1212,6 +1212,15 @@ async def replace_banner_message(callback: CallbackQuery, banner_path: str, capt
         pass
     return await send_banner_message(callback, banner_path, caption, reply_markup)
 
+async def remove_reply_keyboard(entity):
+    try:
+        if hasattr(entity, 'answer'):
+            await entity.answer(' ', reply_markup=ReplyKeyboardRemove())
+        else:
+            await entity.message.answer(' ', reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+
 
 def blocked_text() -> str:
     return "<b>⛔ Доступ ограничен</b>\n\nВаш аккаунт заблокирован администрацией."
@@ -1262,8 +1271,10 @@ async def start_cmd(message: Message, state: FSMContext):
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
     await state.clear()
     if is_user_blocked(message.from_user.id):
+        await remove_reply_keyboard(message)
         await message.answer(blocked_text())
         return
+    await remove_reply_keyboard(message)
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
 
@@ -1313,6 +1324,7 @@ async def withdraw_menu_cb(callback: CallbackQuery, state: FSMContext):
 @router.message(F.text == "👤 Профиль")
 async def profile_view(message: Message, state: FSMContext):
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
+    await remove_reply_keyboard(message)
     await state.clear()
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Мои номера", callback_data="menu:my")
@@ -1324,6 +1336,7 @@ async def profile_view(message: Message, state: FSMContext):
 
 @router.message(F.text == "📲 Сдать номер")
 async def submit_start(message: Message, state: FSMContext):
+    await remove_reply_keyboard(message)
     if is_user_blocked(message.from_user.id):
         await message.answer(blocked_text())
         return
@@ -1331,9 +1344,11 @@ async def submit_start(message: Message, state: FSMContext):
         await message.answer("<b>⛔ Сдача номеров временно выключена.</b>")
         return
     await state.set_state(SubmitStates.waiting_mode)
-    await message.answer(
+    await send_banner_message(
+        message,
+        db.get_setting('start_banner_path', START_BANNER),
         "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:",
-        reply_markup=mode_kb(),
+        mode_kb(),
     )
 
 
@@ -1372,9 +1387,11 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
         if mode == "hold"
         else "🔥 <b>БезХолд</b> — режим работы без времени работы, оплату по режимам смотрите в разделе <b>/start</b> — <b>«Прайсы»</b>."
     )
-    await callback.message.edit_text(
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
         f"<b>Режим выбран: {mode_title}</b>\n\n{mode_desc}\n\n👇 <b>Теперь выберите оператора:</b>",
-        reply_markup=operators_kb(mode),
+        operators_kb(mode),
     )
     await callback.answer()
 
@@ -1382,7 +1399,7 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "op:back")
 async def op_back(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SubmitStates.waiting_mode)
-    await callback.message.edit_text("<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", reply_markup=mode_kb())
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
     await callback.answer()
 
 
@@ -1396,20 +1413,15 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
         return
     await state.update_data(operator_key=operator_key, mode=mode)
     await state.set_state(SubmitStates.waiting_qr)
-    await callback.message.edit_text(
-        "<b>Отправьте QR-код</b>\n\n"
-        "• фото QR\n"
-        "• в подписи укажите номер\n\n"
-        "Допустимый формат номера:\n"
-        "<code>+79991234567</code>\n"
-        "<code>79991234567</code>\n"
-        "<code>89991234567</code>",
-        reply_markup=cancel_inline_kb("menu:home"),
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        "<b>💫 ESIM Service X 💫</b>\n\n<b>📨 Отправьте QR-код - Фото сообщением</b>\n\n👉 <b>Требуется:</b>\n▫️ Фото QR\n▫️ В подписи укажите номер\n\n🔰 <b>Допустимый формат номера:</b>\n<blockquote>+79991234567  «+7»\n79991234567   «7»\n89991234567   «8»</blockquote>\n\nЕсли передумали нажмите ниже - Отмена",
+        cancel_inline_kb("menu:home"),
     )
     await callback.answer()
 
 
-@router.message(SubmitStates.waiting_qr, F.text.in_({"↩️ Назад", "❌ Отмена"}))
 @router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
 async def global_back(message: Message, state: FSMContext):
     await state.clear()
