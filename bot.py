@@ -10,6 +10,7 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
@@ -760,7 +761,7 @@ def user_admin_kb():
 def queue_manage_kb():
     kb = InlineKeyboardBuilder()
     for item in latest_queue_items(10):
-        kb.button(text=f"🗑 #{item['id']} {OPERATORS[item['operator_key']]['title']} {mode_label(item['mode'])}", callback_data=f"admin:queue_remove:{item['id']}")
+        kb.button(text=f"🗑 #{item['id']} {op_text(item['operator_key'])} {mode_label(item['mode'])}", callback_data=f"admin:queue_remove:{item['id']}")
     kb.button(text="↻ Обновить", callback_data="admin:queues")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
@@ -1216,6 +1217,23 @@ def quote_block(lines: list[str]) -> str:
     return '<blockquote>' + '\n'.join(lines) + '</blockquote>'
 
 
+def cancel_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Отмена", callback_data="submit:cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=None):
+    msg = callback.message
+    try:
+        if getattr(msg, "photo", None):
+            await msg.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await msg.edit_text(text=text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        await msg.answer(text, reply_markup=reply_markup)
+
+
 CUSTOM_OPERATOR_EMOJI = {
     "mts": ("5312126452043363774", "🔴"),
     "mega": ("5229218997521631084", "🟢"),
@@ -1321,6 +1339,13 @@ async def start_cmd(message: Message, state: FSMContext):
     await remove_reply_keyboard(message)
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
+
+
+@router.callback_query(F.data == "submit:cancel")
+async def submit_cancel_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+    await callback.answer("Отменено")
 
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, state: FSMContext):
