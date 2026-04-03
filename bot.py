@@ -634,7 +634,12 @@ def esim_mode_kb():
 
 
 def mode_kb():
-    return esim_mode_kb()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏳ Холд", callback_data="mode:hold")
+    kb.button(text="⚡ БезХолд", callback_data="mode:no_hold")
+    kb.button(text="↩️ Назад", callback_data="mode:back")
+    kb.adjust(2, 1)
+    return kb.as_markup()
 
 
 def admin_queue_kb(item: QueueItem):
@@ -2404,8 +2409,17 @@ async def esim_command(message: Message):
 async def esim_choose_mode(callback: CallbackQuery):
     if not is_operator_or_admin(callback.from_user.id):
         return
-    mode = callback.data.split(':',1)[1]
-    await callback.message.edit_text(f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:", reply_markup=operators_kb(mode, 'esim_take'))
+    mode = callback.data.split(':', 1)[1]
+    text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:"
+    try:
+        if getattr(callback.message, 'text', None):
+            await callback.message.edit_text(text, reply_markup=operators_kb(mode, 'esim_take'))
+        elif getattr(callback.message, 'caption', None) is not None:
+            await callback.message.edit_caption(caption=text, reply_markup=operators_kb(mode, 'esim_take'))
+        else:
+            await callback.message.answer(text, reply_markup=operators_kb(mode, 'esim_take'))
+    except Exception:
+        await callback.message.answer(text, reply_markup=operators_kb(mode, 'esim_take'))
     await callback.answer()
 
 
