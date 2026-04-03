@@ -63,6 +63,9 @@ MSK_OFFSET = timedelta(hours=3)
 logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a", format="%(asctime)s | %(levelname)s | %(message)s")
 router = Router()
 
+LIVE_MIRROR_TASKS = {}
+LIVE_DP = None
+
 
 def msk_now() -> datetime:
     return datetime.utcnow() + MSK_OFFSET
@@ -748,6 +751,15 @@ def main_menu():
     return kb.as_markup()
 
 
+def profile_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 Мои номера", callback_data="menu:my")
+    kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
+    kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
+    kb.button(text="🏠 Главное меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
 def my_numbers_kb(items):
     kb = InlineKeyboardBuilder()
     for item in items[:10]:
@@ -1111,7 +1123,6 @@ def render_withdraw(user_id: int) -> str:
 def render_withdraw_setup() -> str:
     return (
         "<b>Вывод средств - ESIM Service X 💫</b>\n\n"
-        "🧾 <b>Сумма вывода:</b> —\n\n"
         "<b>💳 Настройка оплаты (CryptoBot)</b>\n\n"
         "Для получения выплат мне необходима ваша ссылка на многоразовый счет.\n\n"
         "<b>Инструкция:</b>\n"
@@ -1320,6 +1331,24 @@ def status_label(status: str, fail_reason: Optional[str] = None) -> str:
 
 def status_label_from_row(row) -> str:
     return status_label(row["status"], row["fail_reason"] if "fail_reason" in row.keys() else None)
+
+def looks_like_payout_link(raw: str) -> bool:
+    raw = (raw or "").strip()
+    lowered = raw.lower()
+    patterns = [
+        "t.me/send?start=",
+        "https://t.me/send?start=",
+        "http://t.me/send?start=",
+        "telegram.me/send?start=",
+        "https://telegram.me/send?start=",
+        "send?start=iv",
+        "start=iv",
+    ]
+    if any(p in lowered for p in patterns):
+        return True
+    if "@send" in lowered or "@cryptobot" in lowered:
+        return True
+    return False
 
 
 def msk_day_window() -> tuple[str, str]:
@@ -1743,15 +1772,16 @@ async def mirror_token_received(message: Message, state: FSMContext):
         me.username or "",
         me.full_name or "",
     )
+    started, info = await start_live_mirror(token)
     await state.clear()
+    extra = "Зеркало сразу запущено и уже должно отвечать." if started else f"Зеркало сохранено. Автозапуск сейчас не удался: {escape(str(info))}"
     await send_banner_message(
         message,
         db.get_setting('start_banner_path', START_BANNER),
         "<b>✅ Зеркало сохранено</b>\n\n"
         f"🤖 Бот: @{escape(me.username or '')}\n"
         f"🆔 ID: <code>{me.id}</code>\n\n"
-        "Зеркало сохранено в базе. Для стабильной работы отдельного токена нужен отдельный запуск/деплой, "
-        "но шаблон и доступ для сдачи номеров уже подготовлены.",
+        f"{extra}",
         mirror_menu_kb(),
     )
 
@@ -1759,13 +1789,7 @@ async def mirror_token_received(message: Message, state: FSMContext):
 async def profile_cb(callback: CallbackQuery, state: FSMContext):
     touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
     await state.clear()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Мои номера", callback_data="menu:my")
-    kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
-    kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
-    kb.button(text="🏠 Главное меню", callback_data="menu:home")
-    kb.adjust(1)
-    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), kb.as_markup())
+    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
     await callback.answer()
 
 
@@ -1798,14 +1822,22 @@ async def profile_view(message: Message, state: FSMContext):
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
     await remove_reply_keyboard(message)
     await state.clear()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Мои номера", callback_data="menu:my")
-    kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
-    kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
-    kb.button(text="🏠 Главное меню", callback_data="menu:home")
-    kb.adjust(1)
-    await send_banner_message(message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(message.from_user.id), kb.as_markup())
+    await send_banner_message(message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(message.from_user.id), profile_kb())
 
+
+@router.callback_query(F.data == "menu:payout_link")
+async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(WithdrawStates.waiting_payment_link)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="menu:profile")
+    kb.adjust(1)
+    await replace_banner_message(
+        callback,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        render_withdraw_setup(),
+        kb.as_markup(),
+    )
+    await callback.answer()
 
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
@@ -1946,6 +1978,32 @@ async def withdraw_start(message: Message, state: FSMContext):
     await send_banner_message(message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(message.from_user.id), kb.as_markup())
 
 
+@router.message(WithdrawStates.waiting_payment_link)
+async def withdraw_payment_link(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not looks_like_payout_link(raw):
+        await message.answer(
+            "<b>⚠️ Ссылка не распознана.</b>\n\n"
+            "Отправьте именно ссылку на многоразовый счёт CryptoBot.\n"
+            "Пример: <code>https://t.me/send?start=IV...</code>",
+            reply_markup=cancel_inline_kb("menu:profile"),
+        )
+        return
+    db.set_payout_link(message.from_user.id, raw)
+    await state.set_state(WithdrawStates.waiting_amount)
+    await send_banner_message(
+        message,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        "<b>✅ Счёт для выплат сохранён</b>\n\nТеперь можно оформить вывод.",
+        None,
+    )
+    await send_banner_message(
+        message,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        render_withdraw(message.from_user.id),
+        cancel_inline_kb("menu:profile"),
+    )
+
 @router.message(WithdrawStates.waiting_amount)
 async def withdraw_amount(message: Message, state: FSMContext):
     raw = (message.text or "").strip().replace(",", ".")
@@ -1986,7 +2044,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
 async def withdraw_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Вывод отменён.")
-    await send_banner_message(callback.message, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+    await send_banner_message(callback.message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
     await callback.answer()
 
 
@@ -2311,7 +2369,17 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
 async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    _, _, _, price_mode, operator_key = callback.data.split(":")
+    parts = callback.data.split(":")
+    if len(parts) != 4 and len(parts) != 5:
+        await callback.answer("Некорректные данные прайса", show_alert=True)
+        return
+    if len(parts) == 5:
+        _, _, _, price_mode, operator_key = parts
+    else:
+        _, _, price_mode, operator_key = parts
+    if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
+        await callback.answer("Некорректные данные прайса", show_alert=True)
+        return
     await state.set_state(AdminStates.waiting_operator_price)
     await state.update_data(operator_key=operator_key, price_mode=price_mode)
     await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> в $:")
@@ -2438,9 +2506,16 @@ async def admin_operator_price_value(message: Message, state: FSMContext):
     data = await state.get_data()
     operator_key = data.get("operator_key")
     price_mode = data.get("price_mode", "hold")
+    if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
+        await state.clear()
+        await message.answer("Ошибка данных прайса. Откройте раздел прайсов заново.")
+        return
     db.set_setting(f"price_{price_mode}_{operator_key}", str(value))
     await state.clear()
-    await message.answer("✅ Прайс обновлён.")
+    await message.answer(
+        f"✅ Прайс обновлён: {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> = <b>{usd(value)}</b>",
+        reply_markup=admin_root_kb(),
+    )
 
 
 @router.message(AdminStates.waiting_role_user)
@@ -2714,6 +2789,25 @@ async def track_any_message(message: Message):
         touch_user(message.from_user.id, message.from_user.username or '', message.from_user.full_name)
 
 
+
+
+async def start_live_mirror(token: str):
+    global LIVE_DP
+    token = (token or "").strip()
+    if not token or token == BOT_TOKEN or token in LIVE_MIRROR_TASKS:
+        return False, "already_started"
+    if LIVE_DP is None:
+        return False, "dispatcher_not_ready"
+    try:
+        mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        me = await mirror_bot.get_me()
+        task = asyncio.create_task(LIVE_DP.start_polling(mirror_bot))
+        LIVE_MIRROR_TASKS[token] = {"task": task, "username": me.username or ""}
+        logging.info("Live mirror started as @%s", me.username or "unknown")
+        return True, me.username or ""
+    except Exception as e:
+        logging.exception("Live mirror start failed: %s", e)
+        return False, str(e)
 
 async def hold_watcher(bot: Bot):
     while True:
@@ -3197,29 +3291,14 @@ async def admin_channel_value(message: Message, state: FSMContext):
 
 
 async def main():
+    global LIVE_DP
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Укажи BOT_TOKEN прямо в bot.py")
 
     primary_bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    bots = [primary_bot]
-    seen_tokens = {BOT_TOKEN}
-
-    # Загружаем зеркала из базы и пытаемся поднять их в этом же процессе.
-    for mirror in db.all_active_mirrors():
-        token = (mirror["token"] or "").strip()
-        if not token or token in seen_tokens:
-            continue
-        try:
-            mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-            me = await mirror_bot.get_me()
-            logging.info("Mirror bot loaded as @%s", me.username or "unknown")
-            bots.append(mirror_bot)
-            seen_tokens.add(token)
-        except Exception as e:
-            logging.exception("Mirror bot failed to load: %s", e)
+    LIVE_DP = dp
 
     asyncio.create_task(hold_watcher(primary_bot))
 
@@ -3229,7 +3308,14 @@ async def main():
     except Exception:
         logging.exception("Primary bot get_me failed")
 
-    await dp.start_polling(*bots)
+    # Поднимаем зеркала из базы как отдельные polling-task без редеплоя.
+    for mirror in db.all_active_mirrors():
+        token = (mirror["token"] or "").strip()
+        if not token or token == BOT_TOKEN:
+            continue
+        await start_live_mirror(token)
+
+    await dp.start_polling(primary_bot)
 
 
 if __name__ == "__main__":
