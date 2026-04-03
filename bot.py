@@ -10,7 +10,6 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
@@ -641,6 +640,15 @@ def esim_mode_kb():
     return kb.as_markup()
 
 
+def mode_inline_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏳ Холд", callback_data="mode:hold")
+    kb.button(text="⚡ БезХолд", callback_data="mode:no_hold")
+    kb.button(text="↩️ Назад", callback_data="menu:home")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
 def mode_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="⏳ Холд", callback_data="mode:hold")
@@ -739,7 +747,7 @@ def prices_kb():
     for mode in ("hold", "no_hold"):
         mode_label_text = "⏳ Холд" if mode == "hold" else "⚡ БезХолд"
         for key, data in OPERATORS.items():
-            kb.button(text=f"{mode_label_text} • {data['title']}", callback_data=f"admin:set_price:{mode}:{key}")
+            kb.button(text=f"{mode_label_text} • {op_text(key)}", callback_data=f"admin:set_price:{mode}:{key}")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -1230,7 +1238,7 @@ async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=Non
             await msg.edit_caption(caption=text, reply_markup=reply_markup)
         else:
             await msg.edit_text(text=text, reply_markup=reply_markup)
-    except TelegramBadRequest:
+    except Exception:
         await msg.answer(text, reply_markup=reply_markup)
 
 
@@ -1339,13 +1347,6 @@ async def start_cmd(message: Message, state: FSMContext):
     await remove_reply_keyboard(message)
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
-
-
-@router.callback_query(F.data == "submit:cancel")
-async def submit_cancel_cb(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
-    await callback.answer("Отменено")
 
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, state: FSMContext):
@@ -1825,7 +1826,7 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     operator_key = callback.data.split(":")[-1]
     await state.set_state(AdminStates.waiting_operator_price)
     await state.update_data(operator_key=operator_key, mode=mode)
-    await callback.message.answer(f"Введите новую цену для {OPERATORS[operator_key]['title']} в $:")
+    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} в $:")
     await callback.answer()
 
 
