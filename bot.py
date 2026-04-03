@@ -847,18 +847,16 @@ def cancel_inline_kb(back: str = "menu:home"):
     return kb.as_markup()
 
 
-def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:back"):
+def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:back", user_id: int | None = None):
     kb = InlineKeyboardBuilder()
-    labels = {"mts": "🟥 МТС", "bil": "🟨 Билайн", "mega": "🟩 Мегафон", "t2": "⬛ Tele2", "vtb": "🟦 ВТБ", "gaz": "🔷 Газпром"}
     for key in OPERATORS:
         q = count_waiting_mode(key, mode)
-        price = get_mode_price(key, mode)
+        price = get_mode_price(key, mode, user_id)
         prefix_mark = "🚫 " if not is_operator_mode_enabled(key, mode) else ""
         kb.button(text=f"{prefix_mark}{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
-
 
 def esim_mode_kb():
     kb = InlineKeyboardBuilder()
@@ -886,10 +884,10 @@ def mode_kb():
     kb.adjust(2, 1)
     return kb.as_markup()
 
-def submit_result_kb():
+def submit_result_kb(operator_key: str, mode: str):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📲 Сдать ещё", callback_data="menu:submit")
-    kb.button(text="🏠 Домой", callback_data="menu:home")
+    kb.button(text="📲 Сдать ещё", callback_data=f"submit_more:{operator_key}:{mode}")
+    kb.button(text="✅ Я закончил загрузку", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1997,6 +1995,10 @@ async def start_cmd(message: Message, state: FSMContext):
     await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
 
+@router.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer()
+
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, state: FSMContext):
     touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
@@ -2163,7 +2165,7 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
         callback,
         db.get_setting('start_banner_path', START_BANNER),
         f"<b>Режим выбран: {mode_title}</b>\n\n{mode_desc}\n\n👇 <b>Теперь выберите оператора:</b>",
-        operators_kb(mode),
+        operators_kb(mode, "op", "op:back", callback.from_user.id),
     )
     await callback.answer()
 
@@ -2243,7 +2245,7 @@ async def submit_qr(message: Message, state: FSMContext):
         f"📞 Номер: <code>{pretty_phone(phone)}</code>\n"
         f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode, message.from_user.id))}</b>\n"
         f"🔄 Режим: <b>{'Холд' if mode == 'hold' else 'БезХолд'}</b>",
-        reply_markup=submit_result_kb(),
+        reply_markup=submit_result_kb(operator_key, mode),
     )
 
 
@@ -3080,6 +3082,7 @@ async def esim_back_mode(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("esim_mode:"))
 async def esim_choose_mode(callback: CallbackQuery):
+    logging.info("esim_choose_mode callback=%s", callback.data)
     if not is_operator_or_admin(callback.from_user.id):
         return
     mode = callback.data.split(':', 1)[1]
@@ -3090,6 +3093,7 @@ async def esim_choose_mode(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("esim_take:"))
 async def esim_take(callback: CallbackQuery):
+    logging.info("esim_take callback=%s", callback.data)
     if not is_operator_or_admin(callback.from_user.id):
         return
     _, operator_key, mode = callback.data.split(':')
