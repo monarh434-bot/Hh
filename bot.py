@@ -16,7 +16,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
@@ -43,10 +43,10 @@ CRYPTO_PAY_ASSET = "USDT"
 CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
 
 OPERATORS = {
-    "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
-    "bil": {"title": "Билайн", "price": 4.50, "command": "/bil"},
-    "mega": {"title": "Мегафон", "price": 5.00, "command": "/mega"},
-    "t2": {"title": "Tele2", "price": 4.20, "command": "/t2"},
+    "mts": {"title": "МТС", "price": 4.00, "emoji": "🔴", "command": "/esim"},
+    "bil": {"title": "Билайн", "price": 4.50, "emoji": "🟡", "command": "/esim"},
+    "mega": {"title": "Мегафон", "price": 5.00, "emoji": "🟢", "command": "/esim"},
+    "t2": {"title": "Tele2", "price": 4.20, "emoji": "⚫", "command": "/esim"},
 }
 # =========================================================
 
@@ -606,6 +606,30 @@ def my_numbers_kb(items):
     return kb.as_markup()
 
 
+def operator_display(key: str) -> str:
+    return f"{OPERATORS[key].get('emoji', '📱')} {OPERATORS[key]['title']}"
+
+
+def operator_price(key: str, mode: str) -> float:
+    default = float(OPERATORS[key]['price'])
+    suffix = 'hold' if mode == 'hold' else 'no_hold'
+    return float(db.get_setting(f"price_{key}_{suffix}", str(default)))
+
+
+def queue_position(item_id: int) -> int:
+    row = db.conn.execute(
+        "SELECT operator_key, mode FROM queue_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    if not row:
+        return 0
+    row2 = db.conn.execute(
+        "SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' AND id<=?",
+        (row['operator_key'], row['mode'], item_id),
+    ).fetchone()
+    return int(row2['c'] or 0)
+
+
 def cancel_inline_kb(back: str = "menu:home"):
     kb = InlineKeyboardBuilder()
     kb.button(text="❌ Отмена", callback_data=back)
@@ -615,11 +639,12 @@ def cancel_inline_kb(back: str = "menu:home"):
 
 def operators_kb(mode: str = "hold", prefix: str = "op"):
     kb = InlineKeyboardBuilder()
-    labels = {"mts": "🔺 МТС", "bil": "🔸 Билайн", "mega": "▫️ Мегафон", "t2": "▪️ Tele2"}
+    back_cb = "mode:back" if prefix == "op" else "esim_mode:back"
     for key in OPERATORS:
         q = count_waiting_mode(key, mode)
-        kb.button(text=f"{labels.get(key, OPERATORS[key]['title'])} ({q})", callback_data=f"{prefix}:{key}:{mode}")
-    kb.button(text="↩️ Назад", callback_data="mode:back")
+        price = operator_price(key, mode)
+        kb.button(text=f"{operator_display(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+    kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
 
@@ -665,9 +690,11 @@ def confirm_withdraw_kb(amount: float):
 
 
 def withdraw_back_kb():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="↩️ Назад")
-    return kb.as_markup(resize_keyboard=True)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="menu:withdraw")
+    kb.adjust(1)
+    return kb.as_markup()
+
 
 
 def withdraw_admin_kb(withdraw_id: int):
@@ -922,16 +949,27 @@ def render_my_numbers(user_id: int) -> str:
         body = "• За сегодня заявок пока нет."
     else:
         rows = []
+        status_map = {
+            'queued': 'в очереди',
+            'taken': 'взята',
+            'in_progress': 'в работе',
+            'completed': 'оплачена',
+            'failed': 'ошибка',
+            'slipped': 'слет',
+            'user_removed': 'убрана',
+            'admin_removed': 'убрана',
+        }
         for row in items[:10]:
-            rows.append(
-                f"#{row['id']} • {OPERATORS[row['operator_key']]['title']} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])} • <b>{row['status']}</b>"
-            )
+            pos = queue_position(int(row['id'])) if row['status'] == 'queued' else 0
+            pos_text = f" • позиция: {pos}" if pos else ""
+            rows.append(f"#{row['id']} • {OPERATORS[row['operator_key']]['title']} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])}{pos_text} • <b>{status_map.get(row['status'], row['status'])}</b>")
         body = "\n".join(rows)
     return (
         "<b>📦 Мои номера — сегодня</b>\n\n"
         + quote_block([body])
-        + "\n\n<i>Здесь можно посмотреть свои заявки за день и убрать из очереди те, что ещё не взяты в работу.</i>"
+        + "\n\n<i>Здесь можно посмотреть свои заявки за день, увидеть позицию в очереди и убрать из очереди те, что ещё не взяты в работу.</i>"
     )
+
 
 
 def render_admin_home() -> str:
@@ -1435,7 +1473,7 @@ async def submit_qr(message: Message, state: FSMContext):
     if not phone:
         await message.answer(
             "⚠️ Номер должен быть только в формате:\n<code>+79991234567</code>\n<code>79991234567</code>\n<code>89991234567</code>",
-            reply_markup=cancel_menu(),
+            reply_markup=cancel_inline_kb("op:back"),
         )
         return
     data = await state.get_data()
@@ -1473,7 +1511,7 @@ async def submit_qr(message: Message, state: FSMContext):
 
 @router.message(SubmitStates.waiting_qr)
 async def submit_not_photo(message: Message):
-    await message.answer("<b>⚠️ Отправьте именно фото QR-кода с подписью-номером.</b>", reply_markup=cancel_menu())
+    await message.answer("<b>⚠️ Отправьте именно фото QR-кода с подписью-номером.</b>", reply_markup=cancel_inline_kb("op:back"))
 
 
 @router.message(F.text == "💸 Вывод средств")
@@ -1993,24 +2031,9 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
     await message.answer_photo(item.qr_file_id, caption=queue_caption(item), reply_markup=admin_queue_kb(item))
 
 
-@router.message(Command("mts", "mtc"))
-async def queue_mts(message: Message):
-    await send_next_item_for_operator(message, "mts")
-
-
-@router.message(Command("bil"))
-async def queue_bil(message: Message):
-    await send_next_item_for_operator(message, "bil")
-
-
-@router.message(Command("mega"))
-async def queue_mega(message: Message):
-    await send_next_item_for_operator(message, "mega")
-
-
-@router.message(Command("t2"))
-async def queue_t2(message: Message):
-    await send_next_item_for_operator(message, "t2")
+@router.message(Command("mts", "mtc", "bil", "mega", "t2"))
+async def old_operator_commands(message: Message):
+    await message.answer("<b>ℹ️ Команды отдельных операторов отключены.</b>\n\nИспользуйте <code>/esim</code> и выберите режим + оператора кнопками.")
 
 
 @router.message(Command("stata", "Stata"))
@@ -2399,6 +2422,24 @@ async def admin_user_action_text(message: Message, state: FSMContext):
     await state.clear()
 
 
+@router.message(Command("stickerid", "emojiid"))
+async def sticker_id_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    src = message.reply_to_message or message
+    sticker = src.sticker
+    if not sticker:
+        await message.answer("Ответьте командой на стикер: <code>/stickerid</code>")
+        return
+    custom = getattr(sticker, 'custom_emoji_id', None) or '—'
+    await message.answer(
+        "<b>🧩 Данные стикера</b>\n\n"
+        f"<b>file_id:</b> <code>{html.escape(sticker.file_id)}</code>\n"
+        f"<b>file_unique_id:</b> <code>{html.escape(sticker.file_unique_id)}</code>\n"
+        f"<b>custom_emoji_id:</b> <code>{html.escape(str(custom))}</code>"
+    )
+
+
 @router.message(Command("esim"))
 async def esim_command(message: Message):
     if not is_operator_or_admin(message.from_user.id):
@@ -2415,6 +2456,23 @@ async def esim_command(message: Message):
         await message.answer('Эта группа или топик не включены как рабочая зона. Используй /work или /topic.')
         return
     await message.answer('<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:', reply_markup=esim_mode_kb())
+
+
+@router.callback_query(F.data == "esim_mode:back")
+async def esim_mode_back(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
+    try:
+        if getattr(callback.message, 'text', None):
+            await callback.message.edit_text(text, reply_markup=esim_mode_kb())
+        elif getattr(callback.message, 'caption', None) is not None:
+            await callback.message.edit_caption(caption=text, reply_markup=esim_mode_kb())
+        else:
+            await callback.message.answer(text, reply_markup=esim_mode_kb())
+    except Exception:
+        await callback.message.answer(text, reply_markup=esim_mode_kb())
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("esim_mode:"))
@@ -2456,6 +2514,11 @@ async def esim_take(callback: CallbackQuery):
     fresh = db.get_queue_item(item.id)
     photo = fresh.qr_file_id
     await callback.message.answer_photo(photo, caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
+    await notify_user(
+        callback.bot,
+        fresh.user_id,
+        f"<b>📥 Номер взят в обработку</b>\n\n📞 <b>Номер:</b> {pretty_phone(fresh.normalized_phone)}\n{operator_display(fresh.operator_key)}\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}\n🧾 <b>ID заявки:</b> #{fresh.id}",
+    )
     await callback.answer('Заявка выдана')
 
 
