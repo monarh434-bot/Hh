@@ -625,7 +625,7 @@ def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:ba
     for key in OPERATORS:
         q = count_waiting_mode(key, mode)
         price = get_mode_price(key, mode)
-        kb.button(text=f"{labels.get(key, OPERATORS[key]['title'])} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+        kb.button(text=f"{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
@@ -644,7 +644,7 @@ def mode_inline_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="⏳ Холд", callback_data="mode:hold")
     kb.button(text="⚡ БезХолд", callback_data="mode:no_hold")
-    kb.button(text="↩️ Назад", callback_data="menu:home")
+    kb.button(text="↩️ Назад", callback_data="menu:submit")
     kb.adjust(2, 1)
     return kb.as_markup()
 
@@ -2254,6 +2254,286 @@ async def hold_watcher(bot: Bot):
         except Exception:
             logging.exception("hold_watcher failed")
         await asyncio.sleep(5)
+
+
+def render_admin_queue_text() -> str:
+    items = latest_queue_items(10)
+    if not items:
+        return "<b>📦 Очередь</b>\n\n<i>Активных заявок в очереди нет.</i>"
+    rows = []
+    for item in items:
+        pos = queue_position(item['id']) if item['status'] == 'queued' else None
+        pos_text = f" • позиция {pos}" if pos else ""
+        rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
+    return "<b>📦 Очередь</b>\n\n" + quote_block(rows)
+
+@router.callback_query(F.data == "admin:queues")
+async def admin_queues(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:user_tools")
+async def admin_user_tools(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await safe_edit_or_send(callback, "<b>👤 Пользователь</b>\n\nВыберите действие ниже, затем отправьте <b>ID пользователя</b> следующим сообщением.", reply_markup=user_admin_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:toggle_numbers")
+async def admin_toggle_numbers(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    set_numbers_enabled(not is_numbers_enabled())
+    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
+    await callback.answer("Статус обновлён")
+
+@router.callback_query(F.data.startswith("admin:queue_remove:"))
+async def admin_queue_remove(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[-1])
+    remove_queue_item(item_id, reason='admin_removed', admin_id=callback.from_user.id)
+    await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
+    await callback.answer("Удалено из очереди")
+
+@router.callback_query(F.data.startswith("myremove:"))
+async def myremove_cb(callback: CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.split(":")[-1])
+    row = db.conn.execute("SELECT * FROM queue_items WHERE id=? AND user_id=?", (item_id, callback.from_user.id)).fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    if row["status"] != "queued":
+        await callback.answer("Убрать можно только номер из очереди", show_alert=True)
+        return
+    remove_queue_item(item_id, reason='user_removed')
+    items = user_today_queue_items(callback.from_user.id)
+    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
+    await callback.answer("Номер убран")
+
+@router.callback_query(F.data.startswith("take_start:"))
+async def take_start_cb(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[-1])
+    item = db.get_queue_item(item_id)
+    if not item or item.status not in {"queued", "taken"}:
+        await callback.answer("Заявка уже неактуальна", show_alert=True)
+        return
+    thread_id = getattr(callback.message, 'message_thread_id', None)
+    db.start_work(item.id, callback.from_user.id, item.mode, callback.message.chat.id, thread_id, callback.message.message_id)
+    fresh = db.get_queue_item(item.id)
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
+        else:
+            await callback.message.edit_text(queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(
+            fresh.user_id,
+            "<b>✅ Номер — Встал ✅</b>\n\n"
+            "🚀 <b>По вашему номеру началась работа</b>\n\n"
+            f"📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n"
+            f"📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n"
+            f"{mode_emoji(fresh.mode)} <b>Режим:</b> {mode_label(fresh.mode)}"
+        )
+    except Exception:
+        pass
+    await callback.answer("Работа началась")
+
+@router.callback_query(F.data.startswith("error_pre:"))
+async def error_pre_cb(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[-1])
+    item = db.get_queue_item(item_id)
+    if not item:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    db.mark_error_before_start(item_id)
+    fresh = db.get_queue_item(item_id) or item
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(caption=queue_caption(fresh) + "\n\n⚠️ <b>Ошибка — номер не встал.</b>", reply_markup=None)
+        else:
+            await callback.message.edit_text(queue_caption(fresh) + "\n\n⚠️ <b>Ошибка — номер не встал.</b>", reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(
+            item.user_id,
+            "<b>⚠️ Ошибка — номер не встал</b>\n\n"
+            f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
+            "❌ <b>Номер не принят в работу.</b>"
+        )
+    except Exception:
+        pass
+    await callback.answer("Помечено как ошибка")
+
+@router.callback_query(F.data.startswith("instant_pay:"))
+async def instant_pay_cb(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[-1])
+    item = db.get_queue_item(item_id)
+    if not item or item.status != "in_progress" or item.mode != "no_hold":
+        await callback.answer("Оплата недоступна", show_alert=True)
+        return
+    db.complete_queue_item(item_id)
+    db.add_balance(item.user_id, float(item.price))
+    user = db.get_user(item.user_id)
+    balance = float(user["balance"] if user else 0)
+    fresh = db.get_queue_item(item_id) or item
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(caption=queue_caption(fresh) + "\n\n✅ <b>Оплачено.</b>", reply_markup=None)
+        else:
+            await callback.message.edit_text(queue_caption(fresh) + "\n\n✅ <b>Оплачено.</b>", reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(
+            item.user_id,
+            "<b>✅ Оплата за номер</b>\n\n"
+            f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
+            f"💰 <b>Начислено:</b> {usd(item.price)}\n"
+            f"💲 <b>Ваш баланс:</b> {usd(balance)}"
+        )
+    except Exception:
+        pass
+    await callback.answer("Оплачено")
+
+@router.callback_query(F.data.startswith("slip:"))
+async def slip_cb(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[-1])
+    item = db.get_queue_item(item_id)
+    if not item or item.status != "in_progress":
+        await callback.answer("Слет недоступен", show_alert=True)
+        return
+    started = parse_dt(item.work_started_at)
+    worked = "00:00"
+    if started:
+        secs = max(int((msk_now() - started).total_seconds()), 0)
+        worked = f"{secs//60:02d}:{secs%60:02d}"
+    db.conn.execute("UPDATE queue_items SET status='failed', fail_reason='slip', completed_at=? WHERE id=?", (now_str(), item_id))
+    db.conn.commit()
+    fresh = db.get_queue_item(item_id) or item
+    remain = time_left_text(item.hold_until) if item.mode == "hold" else "—"
+    slip_text = queue_caption(fresh) + f"\n\n❌ <b>Номер слетел</b>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
+    try:
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(caption=slip_text, reply_markup=None)
+        else:
+            await callback.message.edit_text(slip_text, reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(
+            item.user_id,
+            f"<b>❌ Номер слетел</b>\n\n📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
+        )
+    except Exception:
+        pass
+    await callback.answer("Слет отмечен")
+
+@router.callback_query(F.data.in_(["admin:user_stats", "admin:user_pm", "admin:user_add_balance", "admin:user_sub_balance", "admin:user_ban", "admin:user_unban"]))
+async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    action = callback.data.split(":")[-1]
+    await state.update_data(user_action=action)
+    await state.set_state(AdminStates.waiting_user_action_id)
+    await callback.message.answer("<b>Введите ID пользователя:</b>")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_user_action_id)
+async def admin_user_action_id(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        target_user_id = int(message.text.strip())
+    except Exception:
+        await message.answer("Введите корректный ID числом.")
+        return
+    data = await state.get_data()
+    action = data.get("user_action")
+    await state.update_data(target_user_id=target_user_id)
+    if action == "stats":
+        user, stats, ops = get_user_full_stats(target_user_id)
+        if not user:
+            await state.clear()
+            await message.answer("Пользователь не найден.")
+            return
+        ops_text = "\n".join([f"• {op_text(row['operator_key'])}: {row['total']} / {usd(row['earned'] or 0)}" for row in ops]) or "• Пока пусто"
+        text_msg = (
+            f"<b>👤 Пользователь</b>\n\n"
+            f"🆔 <code>{target_user_id}</code>\n"
+            f"👤 <b>{escape(user['full_name'] or '')}</b>\n"
+            f"🔗 @{escape(user['username']) if user['username'] else '—'}\n"
+            f"💰 Баланс: <b>{usd(user['balance'])}</b>\n\n"
+            f"📊 Всего: <b>{stats['total'] or 0}</b> | ✅ <b>{stats['completed'] or 0}</b> | ❌ <b>{stats['slipped'] or 0}</b> | ⚠️ <b>{stats['errors'] or 0}</b>\n"
+            f"💵 Заработано: <b>{usd(stats['earned'] or 0)}</b>\n\n"
+            f"<b>📱 По операторам</b>\n{ops_text}"
+        )
+        await state.clear()
+        await message.answer(text_msg)
+        return
+    if action in {"ban", "unban"}:
+        set_user_blocked(target_user_id, action == "ban")
+        await state.clear()
+        await message.answer("Готово.")
+        return
+    if action == "pm":
+        await state.set_state(AdminStates.waiting_user_action_text)
+        await message.answer("Введите текст сообщения для пользователя:")
+        return
+    if action in {"add_balance", "sub_balance"}:
+        await state.set_state(AdminStates.waiting_user_action_value)
+        await message.answer("Введите сумму в $:")
+        return
+    await state.clear()
+
+@router.message(AdminStates.waiting_user_action_value)
+async def admin_user_action_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        value = float(message.text.strip().replace(",", "."))
+    except Exception:
+        await message.answer("Введите сумму числом.")
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    action = data["user_action"]
+    if action == "add_balance":
+        db.add_balance(uid, value)
+    else:
+        db.subtract_balance(uid, value)
+    await state.clear()
+    await message.answer("Баланс обновлён.")
+
+@router.message(AdminStates.waiting_user_action_text)
+async def admin_user_action_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    try:
+        await message.bot.send_message(uid, f"<b>📩 Сообщение от администрации</b>\n\n{escape(message.text)}")
+        await message.answer("Сообщение отправлено.")
+    except Exception:
+        await message.answer("Не удалось отправить сообщение.")
+    await state.clear()
 
 
 async def main():
