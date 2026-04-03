@@ -24,6 +24,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 BOT_TOKEN = "8731355621:AAGBnukT61jO9OOjZFepx_Tqgk1-w3n1gg4"
 DB_PATH = "bot.db"
+LOG_PATH = "bot.log"
 BOT_USERNAME_FALLBACK = "Seamusstest_bot"
 
 # Roles
@@ -37,7 +38,7 @@ DEFAULT_HOLD_MINUTES = 15
 DEFAULT_TREASURY_BALANCE = 0.0
 
 # Crypto Bot / Crypto Pay API
-CRYPTO_PAY_TOKEN = ""  # fill to enable real checks
+CRYPTO_PAY_TOKEN = "561528:AALC6ucd7Ge10ZgaYiPhpITrc7nRUQhBr1N"
 CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 CRYPTO_PAY_ASSET = "USDT"
 CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
@@ -57,7 +58,14 @@ PROFILE_BANNER = "profile_banner.jpg"
 WITHDRAW_BANNER = "withdraw_banner.jpg"
 MSK_OFFSET = timedelta(hours=3)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 router = Router()
 
 
@@ -96,6 +104,7 @@ class AdminStates(StatesGroup):
     waiting_user_action_id = State()
     waiting_user_action_value = State()
     waiting_user_action_text = State()
+    waiting_db_upload = State()
 
 
 @dataclass
@@ -703,9 +712,8 @@ def admin_root_kb():
     kb.button(text="🛰 Рабочие зоны", callback_data="admin:workspaces")
     kb.button(text="📦 Очередь", callback_data="admin:queues")
     kb.button(text="👤 Пользователь", callback_data="admin:user_tools")
-    kb.button(text="🎛 Приём номеров", callback_data="admin:toggle_numbers")
     kb.button(text="⚙️ Настройки", callback_data="admin:settings")
-    kb.adjust(2,2,2,2,2,1)
+    kb.adjust(2,2,2,2,1)
     return kb.as_markup()
 
 
@@ -735,6 +743,7 @@ def hold_kb():
 def settings_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
+    kb.button(text="🎛 Приём номеров", callback_data="admin:toggle_numbers")
     kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
     kb.button(text="📣 Объявление", callback_data="admin:set_ad_text")
     kb.button(text="↩️ Назад", callback_data="admin:home")
@@ -1823,10 +1832,17 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
 async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    operator_key = callback.data.split(":")[-1]
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    mode = parts[2]
+    operator_key = parts[3]
     await state.set_state(AdminStates.waiting_operator_price)
-    await state.update_data(operator_key=operator_key, mode=mode)
-    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} в $:")
+    await state.update_data(operator_key=operator_key, price_mode=mode)
+    await callback.message.answer(
+        f"Введите новую цену для {op_text(operator_key)} в режиме <b>{mode_label(mode)}</b> в $:"
+    )
     await callback.answer()
 
 
@@ -1933,7 +1949,7 @@ async def admin_operator_price_value(message: Message, state: FSMContext):
     price_mode = data.get("price_mode", "hold")
     db.set_setting(f"price_{price_mode}_{operator_key}", str(value))
     await state.clear()
-    await message.answer("✅ Прайс обновлён.")
+    await message.answer(f"✅ Прайс обновлён: {op_text(operator_key)} • {mode_label(price_mode)} = {usd(value)}")
 
 
 @router.message(AdminStates.waiting_role_user)
@@ -2534,6 +2550,87 @@ async def admin_user_action_text(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Не удалось отправить сообщение.")
     await state.clear()
+
+
+
+@router.message(Command("dbsqulite"))
+async def export_db_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    db.conn.commit()
+    if not Path(DB_PATH).exists():
+        await message.answer("Файл базы данных не найден.")
+        return
+    await message.answer_document(FSInputFile(DB_PATH), caption="<b>🗄 SQLite база данных</b>")
+
+@router.message(Command("dblog"))
+async def export_log_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not Path(LOG_PATH).exists():
+        await message.answer("Лог-файл пока не создан.")
+        return
+    await message.answer_document(FSInputFile(LOG_PATH), caption="<b>📄 Логи бота</b>")
+
+@router.message(Command("uploadsqlite"))
+@router.message(Command("dbupload"))
+async def db_upload_command(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_db_upload)
+    await message.answer(
+        "<b>📥 Загрузка базы данных</b>\n\n"
+        "Отправьте файлом новую базу <code>bot.db</code> или любой <code>.db</code>/<code>.sqlite</code>.\n"
+        "После загрузки бот сохранит файл и попросит перезапустить сервис."
+    )
+
+@router.message(AdminStates.waiting_db_upload, F.document)
+async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not (name.endswith(".db") or name.endswith(".sqlite") or name == "bot.db"):
+        await message.answer("Отправьте файл базы данных с расширением <code>.db</code> или <code>.sqlite</code>.")
+        return
+    temp_path = Path(DB_PATH + ".uploaded")
+    await bot.download(doc, destination=temp_path)
+    # quick validation: open sqlite
+    try:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(temp_path))
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        conn.close()
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        await message.answer("❌ Файл не похож на рабочую SQLite базу.")
+        return
+
+    backup_path = Path(DB_PATH + ".backup")
+    try:
+        if Path(DB_PATH).exists():
+            shutil.copyfile(DB_PATH, backup_path)
+        shutil.move(str(temp_path), DB_PATH)
+    except Exception as e:
+        await message.answer(f"❌ Не удалось заменить базу: <code>{escape(str(e))}</code>")
+        return
+
+    await state.clear()
+    await message.answer(
+        "<b>✅ База данных загружена</b>\n\n"
+        f"Новый файл сохранён как <code>{escape(DB_PATH)}</code>.\n"
+        "Перезапустите Railway, чтобы бот подхватил новую базу.\n"
+        f"Резервная копия старой базы: <code>{escape(str(backup_path))}</code>"
+    )
+
+@router.message(AdminStates.waiting_db_upload)
+async def db_upload_wait_other(message: Message):
+    await message.answer("Пришлите именно файл базы данных <code>.db</code> или <code>.sqlite</code>.")
+
 
 
 async def main():
