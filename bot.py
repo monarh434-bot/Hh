@@ -633,6 +633,10 @@ def esim_mode_kb():
     return kb.as_markup()
 
 
+def mode_kb():
+    return esim_mode_kb()
+
+
 def admin_queue_kb(item: QueueItem):
     kb = InlineKeyboardBuilder()
     if item.status in {"queued", "taken"}:
@@ -830,17 +834,17 @@ def render_start(user_id: int) -> str:
     title = escape(db.get_setting("start_title", "ESIM Service X"))
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
     description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
-    hold_lines = [
-        f"🔺 <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b>",
-        f"🔸 <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b>",
-        f"▫️ <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b>",
-        f"▪️ <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b>",
+    price_lines = [
+        f"🔺 <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
+        f"🔸 <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
+        f"▫️ <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
+        f"▪️ <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
     ]
     queue_lines = [
-        f"🔺 <b>МТС:</b> {db.count_waiting('mts')}",
-        f"🔸 <b>Билайн:</b> {db.count_waiting('bil')}",
-        f"▫️ <b>Мегафон:</b> {db.count_waiting('mega')}",
-        f"▪️ <b>Tele2:</b> {db.count_waiting('t2')}",
+        f"🔺 <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
+        f"🔸 <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
+        f"▫️ <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
+        f"▪️ <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
     ]
     return (
         f"<b>💫 {title} 💫</b>\n"
@@ -851,9 +855,9 @@ def render_start(user_id: int) -> str:
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
         f"💰 <b>Баланс:</b> <b>{balance}</b>\n"
         "━━━━━━━━━━━━━━\n\n"
-        "<b>💎 Прайсы (Холд):</b>\n"
-        + quote_block(hold_lines) + "\n\n"
-        + "<b>📤 Очереди:</b>\n"
+        "<b>💎 Прайсы (Холд / БезХолд):</b>\n"
+        + quote_block(price_lines) + "\n\n"
+        + "<b>📤 Очереди (Холд / БезХолд):</b>\n"
         + quote_block(queue_lines) + "\n\n"
         + "<i>Вы находитесь в главном меню.</i>\n👇 <b>Выберите нужное действие ниже:</b>"
     )
