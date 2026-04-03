@@ -2124,6 +2124,42 @@ async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+@router.callback_query(F.data.startswith("submit_more:"))
+async def submit_more(callback: CallbackQuery, state: FSMContext):
+    if is_user_blocked(callback.from_user.id):
+        await callback.answer("Аккаунт заблокирован", show_alert=True)
+        return
+    if not is_numbers_enabled():
+        await callback.answer("Сдача номеров выключена", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректная кнопка", show_alert=True)
+        return
+    _, operator_key, mode = parts
+    if operator_key not in OPERATORS:
+        await callback.answer("Неизвестный оператор", show_alert=True)
+        return
+    if mode not in {"hold", "no_hold"}:
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+    if not is_operator_mode_enabled(operator_key, mode):
+        await callback.answer("Сдача по этому оператору и режиму сейчас выключена.", show_alert=True)
+        return
+
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await state.set_state(SubmitStates.waiting_qr)
+    await callback.message.answer(
+        "<b>📨 Загрузите следующий QR-код</b>\n\n"
+        f"📱 <b>Оператор:</b> {op_html(operator_key)}\n"
+        f"🔄 <b>Режим:</b> {mode_label(mode)}\n"
+        f"💰 <b>Цена:</b> <b>{usd(get_mode_price(operator_key, mode, callback.from_user.id))}</b>\n\n"
+        "Отправьте <b>ещё одно фото QR</b> с подписью-номером другого номера.\n"
+        "Когда закончите, нажмите <b>«Я закончил загрузку»</b>.",
+        reply_markup=cancel_inline_kb("menu:home"),
+    )
+    await callback.answer("Можно загружать следующий QR")
+
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
     if is_user_blocked(callback.from_user.id):
