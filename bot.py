@@ -389,6 +389,8 @@ class Database:
 
     def find_user_by_username(self, username: str):
         username = (username or "").lstrip("@").strip().lower()
+        if not username:
+            return None
         return self.conn.execute("SELECT * FROM users WHERE lower(username)=?", (username,)).fetchone()
 
     def find_last_user_by_phone(self, phone: str):
@@ -1268,10 +1270,10 @@ def render_admin_settings() -> str:
 
 def render_operator_modes() -> str:
     lines = []
-    for key, data in OPERATORS.items():
+    for key in OPERATORS:
         hold_status = "✅" if is_operator_mode_enabled(key, "hold") else "🚫"
         nh_status = "✅" if is_operator_mode_enabled(key, "no_hold") else "🚫"
-        lines.append(f"{op_text(key)}\n• Холд: <b>{hold_status}</b>\n• БезХолд: <b>{nh_status}</b>")
+        lines.append(f"{op_text(key)}\n• Холд: {hold_status}\n• БезХолд: {nh_status}")
     return "<b>🎛 Приём номеров по операторам</b>\n\n" + "\n\n".join(lines)
 
 def operator_modes_kb():
@@ -1663,12 +1665,24 @@ def resolve_user_input(raw: str):
     raw = (raw or "").strip()
     if not raw:
         return None
+
     if raw.lstrip("-").isdigit():
-        return db.get_user(int(raw))
-    if raw.startswith("@") or raw.isalnum():
-        user = db.find_user_by_username(raw)
+        user = db.get_user(int(raw))
         if user:
             return user
+
+    username_candidate = raw.lstrip("@").strip()
+    if username_candidate:
+        user = db.find_user_by_username(username_candidate)
+        if user:
+            return user
+        user = db.conn.execute(
+            "SELECT * FROM users WHERE lower(username) LIKE ? ORDER BY user_id DESC LIMIT 1",
+            (username_candidate.lower(),),
+        ).fetchone()
+        if user:
+            return user
+
     return db.find_last_user_by_phone(raw)
 
 
@@ -2253,7 +2267,7 @@ async def admin_settings(callback: CallbackQuery):
 async def admin_operator_modes(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_operator_modes(), reply_markup=operator_modes_kb())
+    await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:toggle_avail:"))
@@ -2262,7 +2276,7 @@ async def admin_toggle_avail(callback: CallbackQuery):
         return
     _, _, _, mode, operator_key = callback.data.split(":")
     set_operator_mode_enabled(operator_key, mode, not is_operator_mode_enabled(operator_key, mode))
-    await callback.message.edit_text(render_operator_modes(), reply_markup=operator_modes_kb())
+    await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
     await callback.answer("Статус обновлён")
 
 @router.callback_query(F.data == "admin:design")
@@ -3110,7 +3124,7 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[-1]
     await state.update_data(user_action=action)
     await state.set_state(AdminStates.waiting_user_action_id)
-    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>")
+    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>\n\n<i>Примеры:</i> <code>626387429</code> или <code>@tyyttooo</code>")
     await callback.answer()
 
 @router.message(AdminStates.waiting_user_action_id)
@@ -3173,27 +3187,11 @@ async def admin_user_action_id(message: Message, state: FSMContext):
         ) or "• Индивидуальные прайсы не заданы."
         await state.set_state(AdminStates.waiting_user_custom_price_text)
         await message.answer(
+            "<b>✅ Пользователь найден</b>\n\n"
+            f"👤 <b>{escape(user['full_name'] or '')}</b>\n"
+            f"🆔 <code>{target_user_id}</code>\n"
+            f"🔗 @{escape(user['username']) if user['username'] else '—'}\n\n"
             "<b>Введите персональный прайс</b>\n\n"
-            f"Пользователь: <code>{target_user_id}</code>\n\n"
-            "<b>Текущие персональные прайсы:</b>\n"
-            f"{current}\n\n"
-            "Формат: <code>оператор режим цена</code>\n"
-            "Пример: <code>bil no_hold 6.5</code>\n"
-            "Или: <code>mts hold 7</code>\n"
-            "Чтобы удалить персональный прайс: <code>mts hold reset</code>"
-        )
-        return
-        return
-    if action == "set_price":
-        prices = db.list_user_prices(target_user_id)
-        current = "\n".join(
-            f"• {op_text(row['operator_key'])} • {mode_label(row['mode'])} = <b>{usd(row['price'])}</b>"
-            for row in prices
-        ) or "• Индивидуальные прайсы не заданы."
-        await state.set_state(AdminStates.waiting_user_custom_price_text)
-        await message.answer(
-            "<b>Введите персональный прайс</b>\n\n"
-            f"Пользователь: <code>{target_user_id}</code>\n\n"
             "<b>Текущие персональные прайсы:</b>\n"
             f"{current}\n\n"
             "Формат: <code>оператор режим цена</code>\n"
@@ -3349,6 +3347,7 @@ async def db_upload_wrong(message: Message):
     await message.answer("Пришлите файл базы <code>.db</code> или <code>.sqlite</code>.")
 
 
+@router.message(Command("stats"))
 @router.message(Command("stata"))
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
