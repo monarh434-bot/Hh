@@ -814,7 +814,7 @@ def escape(value: Optional[str]) -> str:
 
 def queue_caption(item: QueueItem) -> str:
     text = (
-        f"📱 <b>{OPERATORS[item.operator_key]['title']}</b>\n\n"
+        f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
         f"👤 От: <b>{escape(item.full_name)}</b>\n"
         f"🆔 ID: <code>{item.user_id}</code>\n"
@@ -845,20 +845,20 @@ def render_start(user_id: int) -> str:
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
     description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
     price_lines = [
-        f"🟥 <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
-        f"🟨 <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
-        f"🟩 <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
-        f"⬛ <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
-        f"🟦 <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold'))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold'))}</b>",
-        f"🔷 <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold'))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold'))}</b>",
+        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
+        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
+        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
+        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
+        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold'))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold'))}</b>",
+        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold'))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold'))}</b>",
     ]
     queue_lines = [
-        f"🟥 <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
-        f"🟨 <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
-        f"🟩 <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
-        f"⬛ <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
-        f"🟦 <b>ВТБ:</b> {count_waiting_mode('vtb', 'hold')} / {count_waiting_mode('vtb', 'no_hold')}",
-        f"🔷 <b>Газпром:</b> {count_waiting_mode('gaz', 'hold')} / {count_waiting_mode('gaz', 'no_hold')}",
+        f"{op_emoji_html('mts')} <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
+        f"{op_emoji_html('bil')} <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
+        f"{op_emoji_html('mega')} <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
+        f"{op_emoji_html('t2')} <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
+        f"{op_emoji_html('vtb')} <b>ВТБ:</b> {count_waiting_mode('vtb', 'hold')} / {count_waiting_mode('vtb', 'no_hold')}",
+        f"{op_emoji_html('gaz')} <b>Газпром:</b> {count_waiting_mode('gaz', 'hold')} / {count_waiting_mode('gaz', 'no_hold')}",
     ]
     return (
         f"<b>💫 {title} 💫</b>\n"
@@ -885,7 +885,7 @@ def render_profile(user_id: int) -> str:
     username = f"@{escape(user['username'])}" if user and user['username'] else "—"
     full_name = escape(user['full_name'] if user else '')
     ops_text = "\n".join(
-        f"• <b>{OPERATORS[row['operator_key']]['title']}</b>: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
+        f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
         for row in ops
     ) or "• <i>Пока пусто</i>"
     return (
@@ -935,7 +935,7 @@ def render_my_numbers(user_id: int) -> str:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
             rows.append(
-                f"#{row['id']} • {OPERATORS[row['operator_key']]['title']} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])} • <b>{row['status']}</b>{pos_text}"
+                f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])} • <b>{row['status']}</b>{pos_text}"
             )
         body = "\n".join(rows)
     return (
@@ -960,7 +960,7 @@ def render_admin_home() -> str:
 def render_admin_summary() -> str:
     lines = []
     for key, data in OPERATORS.items():
-        lines.append(f"• {data['title']}: {db.count_waiting(key)}")
+        lines.append(f"• {op_text(key)}: {db.count_waiting(key)}")
     return "<b>📊 Сводка очередей</b>\n\n" + "\n".join(lines)
 
 
@@ -1020,8 +1020,8 @@ def render_broadcast() -> str:
 
 
 def render_admin_prices() -> str:
-    hold_lines = [f"• {data['title']}: <b>{usd(get_mode_price(key, 'hold'))}</b>" for key, data in OPERATORS.items()]
-    no_hold_lines = [f"• {data['title']}: <b>{usd(get_mode_price(key, 'no_hold'))}</b>" for key, data in OPERATORS.items()]
+    hold_lines = [f"• {op_text(key)}: <b>{usd(get_mode_price(key, 'hold'))}</b>" for key, data in OPERATORS.items()]
+    no_hold_lines = [f"• {op_text(key)}: <b>{usd(get_mode_price(key, 'no_hold'))}</b>" for key, data in OPERATORS.items()]
     return "<b>💎 Прайсы</b>\n\n<b>⏳ Холд</b>\n" + "\n".join(hold_lines) + "\n\n<b>⚡ БезХолд</b>\n" + "\n".join(no_hold_lines)
 
 
@@ -1195,7 +1195,7 @@ def find_user_text(target_user_id: int) -> str:
     user, stats, ops = get_user_full_stats(target_user_id)
     if not user:
         return "❌ Пользователь не найден в базе."
-    ops_text = "\n".join([f"• {OPERATORS[row['operator_key']]['title']}: {row['total']} / {usd(row['earned'] or 0)}" for row in ops]) or "• Пока пусто"
+    ops_text = "\n".join([f"• {op_text(row['operator_key'])}: {row['total']} / {usd(row['earned'] or 0)}" for row in ops]) or "• Пока пусто"
     return (
         f"<b>👤 Пользователь</b>\n\n"
         f"🆔 <code>{target_user_id}</code>\n"
@@ -1214,6 +1214,29 @@ def find_user_text(target_user_id: int) -> str:
 
 def quote_block(lines: list[str]) -> str:
     return '<blockquote>' + '\n'.join(lines) + '</blockquote>'
+
+
+CUSTOM_OPERATOR_EMOJI = {
+    "mts": ("5312126452043363774", "🔴"),
+    "mega": ("5229218997521631084", "🟢"),
+    "bil": ("5280919528908267119", "🟡"),
+    "t2": ("5244453379664534900", "⚫"),
+    "vtb": ("5427154326294376920", "🔵"),
+    "gaz": ("5280751174780199841", "🔷"),
+}
+
+def op_emoji_html(operator_key: str) -> str:
+    emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+    return fallback
+
+def op_html(operator_key: str) -> str:
+    return f"{op_emoji_html(operator_key)} <b>{escape(OPERATORS[operator_key]['title'])}</b>"
+
+def op_text(operator_key: str) -> str:
+    fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
+    return f"{fallback} {OPERATORS[operator_key]['title']}"
 
 
 async def send_banner_message(entity, banner_path: str, caption: str, reply_markup=None):
@@ -1466,7 +1489,7 @@ async def submit_qr(message: Message, state: FSMContext):
     await message.answer(
         "<b>✅ Заявка принята</b>\n\n"
         f"🧾 ID заявки: <b>{item_id}</b>\n"
-        f"📱 Оператор: <b>{OPERATORS[operator_key]['title']}</b>\n"
+        f"📱 Оператор: {op_html(operator_key)}\n"
         f"📞 Номер: <code>{pretty_phone(phone)}</code>\n"
         f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode))}</b>\n"
         f"🔄 Режим: <b>{'Холд' if mode == 'hold' else 'БезХолд'}</b>",
@@ -1989,7 +2012,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         return
     item = db.get_next_queue_item(operator_key)
     if not item:
-        await message.answer(f"📭 Для оператора {OPERATORS[operator_key]['title']} очередь пуста.")
+        await message.answer(f"📭 Для оператора {op_text(operator_key)} очередь пуста.")
         return
     db.mark_taken(item.id, message.from_user.id)
     item = db.get_queue_item(item.id)
@@ -2124,7 +2147,7 @@ async def esim_take(callback: CallbackQuery):
     try:
         await callback.bot.send_message(
             fresh.user_id,
-            f"<b>📥 Номер взят в обработку</b>\n\n🧾 <b>Заявка:</b> #{fresh.id}\n📱 <b>Оператор:</b> {OPERATORS[fresh.operator_key]['title']}\n📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}"
+            f"<b>📥 Номер взят в обработку</b>\n\n🧾 <b>Заявка:</b> #{fresh.id}\n📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}"
         )
     except Exception:
         pass
