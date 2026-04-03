@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import sqlite3
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,7 +25,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 BOT_TOKEN = "8731355621:AAGBnukT61jO9OOjZFepx_Tqgk1-w3n1gg4"
 DB_PATH = "bot.db"
-LOG_PATH = "bot.log"
 BOT_USERNAME_FALLBACK = "Seamusstest_bot"
 
 # Roles
@@ -33,12 +33,13 @@ BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
+LOG_CHANNEL_ID = 0
 MIN_WITHDRAW = 10.0
 DEFAULT_HOLD_MINUTES = 15
 DEFAULT_TREASURY_BALANCE = 0.0
 
 # Crypto Bot / Crypto Pay API
-CRYPTO_PAY_TOKEN = "561528:AALC6ucd7Ge10ZgaYiPhpITrc7nRUQhBr1N"
+CRYPTO_PAY_TOKEN = "561528:AALC6ucd7Ge10ZgaYiPhpITrc7nRUQhBr1N"  # configured
 CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 CRYPTO_PAY_ASSET = "USDT"
 CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
@@ -58,14 +59,7 @@ PROFILE_BANNER = "profile_banner.jpg"
 WITHDRAW_BANNER = "withdraw_banner.jpg"
 MSK_OFFSET = timedelta(hours=3)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a", format="%(asctime)s | %(levelname)s | %(message)s")
 router = Router()
 
 
@@ -105,6 +99,7 @@ class AdminStates(StatesGroup):
     waiting_user_action_value = State()
     waiting_user_action_text = State()
     waiting_db_upload = State()
+    waiting_channel_value = State()
 
 
 @dataclass
@@ -288,6 +283,28 @@ class Database:
             (user_id, username, full_name),
         )
         self.conn.commit()
+
+
+    def find_user_by_username(self, username: str):
+        username = (username or "").lstrip("@").strip().lower()
+        return self.conn.execute("SELECT * FROM users WHERE lower(username)=?", (username,)).fetchone()
+
+    def find_last_user_by_phone(self, phone: str):
+        normalized = normalize_phone(phone) if phone else None
+        if not normalized:
+            return None
+        return self.conn.execute(
+            "SELECT u.* FROM queue_items q JOIN users u ON u.user_id=q.user_id WHERE q.normalized_phone=? ORDER BY q.id DESC LIMIT 1",
+            (normalized,),
+        ).fetchone()
+
+    def all_user_ids(self):
+        rows = self.conn.execute("SELECT user_id FROM users ORDER BY user_id ASC").fetchall()
+        return [int(r["user_id"]) for r in rows]
+
+    def export_usernames(self) -> str:
+        rows = self.conn.execute("SELECT username FROM users WHERE username IS NOT NULL AND username != '' ORDER BY username COLLATE NOCASE").fetchall()
+        return "\n".join(f"@{r['username'].lstrip('@')}" for r in rows)
 
     def get_user(self, user_id: int):
         return self.conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -713,7 +730,7 @@ def admin_root_kb():
     kb.button(text="📦 Очередь", callback_data="admin:queues")
     kb.button(text="👤 Пользователь", callback_data="admin:user_tools")
     kb.button(text="⚙️ Настройки", callback_data="admin:settings")
-    kb.adjust(2,2,2,2,1)
+    kb.adjust(2,2,2,2,2,1)
     return kb.as_markup()
 
 
@@ -743,9 +760,10 @@ def hold_kb():
 def settings_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
-    kb.button(text="🎛 Приём номеров", callback_data="admin:toggle_numbers")
     kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
-    kb.button(text="📣 Объявление", callback_data="admin:set_ad_text")
+    kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
+    kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
+    kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -1000,7 +1018,9 @@ def render_admin_settings() -> str:
         f"📉 Мин. вывод: <b>{usd(float(db.get_setting('min_withdraw', str(MIN_WITHDRAW))))}</b>\n"
         f"📥 Приём номеров: <b>{'Включен' if is_numbers_enabled() else 'Выключен'}</b>\n"
         f"📝 Старт-заголовок: <b>{escape(db.get_setting('start_title', 'ESIM Service X'))}</b>\n"
-        f"📣 Объявление: <b>{'задано' if db.get_setting('announcement_text', '').strip() else 'пусто'}</b>"
+        f"💸 Канал выплат: <code>{escape(db.get_setting('withdraw_channel_id', str(WITHDRAW_CHANNEL_ID)))}</code>\n"
+        f"🧾 Канал логов: <code>{escape(db.get_setting('log_channel_id', str(LOG_CHANNEL_ID)))}</code>\n"
+        f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
     )
 
 
@@ -1009,8 +1029,8 @@ def render_design() -> str:
         "<b>🎨 Дизайн и тексты</b>\n\n"
         f"🪪 Заголовок: <b>{escape(db.get_setting('start_title', 'DIAMOND HUB'))}</b>\n"
         f"💬 Подзаголовок: <b>{escape(db.get_setting('start_subtitle', ''))}</b>\n"
-        f"📣 Объявление: <b>{'есть' if db.get_setting('announcement_text', '').strip() else 'нет'}</b>\n\n"
-        "Здесь можно менять оформление главного экрана и текст объявления.\n"
+        f"📣 Рассылка: <b>{'есть' if db.get_setting('announcement_text', '').strip() else 'нет'}</b>\n\n"
+        "Здесь можно менять оформление главного экрана и текст рассылки.\n"
         "Поддерживается HTML Telegram: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;blockquote&gt;</code>."
     )
 
@@ -1096,6 +1116,8 @@ def ensure_extra_schema():
         'start_banner_path': START_BANNER,
         'profile_banner_path': PROFILE_BANNER,
         'withdraw_banner_path': WITHDRAW_BANNER,
+        'withdraw_channel_id': str(WITHDRAW_CHANNEL_ID),
+        'log_channel_id': str(LOG_CHANNEL_ID),
     }
     for mode in ('hold','no_hold'):
         for key,data in OPERATORS.items():
@@ -1311,6 +1333,28 @@ async def notify_user(bot: Bot, user_id: int, text: str):
         logging.exception("notify_user failed")
 
 
+async def send_log(bot: Bot, text: str):
+    logging.info(re.sub(r"<[^>]+>", "", text))
+    channel_id = int(db.get_setting("log_channel_id", str(LOG_CHANNEL_ID) or "0") or 0)
+    if channel_id:
+        try:
+            await bot.send_message(channel_id, text)
+        except Exception:
+            logging.exception("send_log failed")
+
+def resolve_user_input(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.lstrip("-").isdigit():
+        return db.get_user(int(raw))
+    if raw.startswith("@") or raw.isalnum():
+        user = db.find_user_by_username(raw)
+        if user:
+            return user
+    return db.find_last_user_by_phone(raw)
+
+
 async def create_crypto_check(amount: float, user_id: Optional[int] = None) -> tuple[Optional[int], Optional[str], str]:
     if not CRYPTO_PAY_TOKEN:
         return None, None, "CRYPTO_PAY_TOKEN не заполнен, поэтому выдана ручная заявка вместо чека."
@@ -1430,7 +1474,7 @@ async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
 async def mode_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     text = "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:"
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), text, mode_inline_kb())
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), text, mode_kb())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("mode:"))
@@ -1736,7 +1780,7 @@ async def admin_broadcast_write(callback: CallbackQuery, state: FSMContext):
 async def admin_broadcast_preview(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    ad = db.get_setting("announcement_text", "").strip()
+    ad = db.get_setting("broadcast_text", "").strip()
     await callback.message.answer(ad or "Объявление пока пустое.")
     await callback.answer()
 
@@ -1745,7 +1789,7 @@ async def admin_broadcast_preview(callback: CallbackQuery):
 async def admin_broadcast_send_ad(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    ad = db.get_setting("announcement_text", "").strip()
+    ad = db.get_setting("broadcast_text", "").strip()
     if not ad:
         await callback.answer("Сначала сохрани объявление", show_alert=True)
         return
@@ -1787,7 +1831,7 @@ async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_ad_text)
     await callback.message.answer(
-        "Отправьте текст объявления.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
+        "Отправьте текст рассылки.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
     )
     await callback.answer()
 
@@ -1832,17 +1876,10 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
 async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    parts = callback.data.split(":")
-    if len(parts) < 4:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    mode = parts[2]
-    operator_key = parts[3]
+    operator_key = callback.data.split(":")[-1]
     await state.set_state(AdminStates.waiting_operator_price)
-    await state.update_data(operator_key=operator_key, price_mode=mode)
-    await callback.message.answer(
-        f"Введите новую цену для {op_text(operator_key)} в режиме <b>{mode_label(mode)}</b> в $:"
-    )
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} в $:")
     await callback.answer()
 
 
@@ -1949,7 +1986,7 @@ async def admin_operator_price_value(message: Message, state: FSMContext):
     price_mode = data.get("price_mode", "hold")
     db.set_setting(f"price_{price_mode}_{operator_key}", str(value))
     await state.clear()
-    await message.answer(f"✅ Прайс обновлён: {op_text(operator_key)} • {mode_label(price_mode)} = {usd(value)}")
+    await message.answer("✅ Прайс обновлён.")
 
 
 @router.message(AdminStates.waiting_role_user)
@@ -2328,6 +2365,7 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
     remove_queue_item(item_id, reason='user_removed')
     items = user_today_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
+    await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{item_id}</b>")
     await callback.answer("Номер убран")
 
 @router.callback_query(F.data.startswith("take_start:"))
@@ -2360,6 +2398,7 @@ async def take_start_cb(callback: CallbackQuery):
         )
     except Exception:
         pass
+    await send_log(callback.bot, f"<b>🚀 Работа началась</b>\n👤 Взял: {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{fresh.id}</b>\n📱 {op_html(fresh.operator_key)}\n📞 <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 {mode_label(fresh.mode)}")
     await callback.answer("Работа началась")
 
 @router.callback_query(F.data.startswith("error_pre:"))
@@ -2389,6 +2428,7 @@ async def error_pre_cb(callback: CallbackQuery):
         )
     except Exception:
         pass
+    await send_log(callback.bot, f"<b>⚠️ Ошибка заявки</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>\n📱 {op_html(item.operator_key)}")
     await callback.answer("Помечено как ошибка")
 
 @router.callback_query(F.data.startswith("instant_pay:"))
@@ -2422,6 +2462,7 @@ async def instant_pay_cb(callback: CallbackQuery):
         )
     except Exception:
         pass
+    await send_log(callback.bot, f"<b>💸 Оплата номера</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>\n📱 {op_html(item.operator_key)}\n💰 {usd(item.price)}")
     await callback.answer("Оплачено")
 
 @router.callback_query(F.data.startswith("slip:"))
@@ -2457,6 +2498,7 @@ async def slip_cb(callback: CallbackQuery):
         )
     except Exception:
         pass
+    await send_log(callback.bot, f"<b>❌ Слет</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>\n📱 {op_html(item.operator_key)}")
     await callback.answer("Слет отмечен")
 
 @router.callback_query(F.data.in_(["admin:user_stats", "admin:user_pm", "admin:user_add_balance", "admin:user_sub_balance", "admin:user_ban", "admin:user_unban"]))
@@ -2466,7 +2508,7 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[-1]
     await state.update_data(user_action=action)
     await state.set_state(AdminStates.waiting_user_action_id)
-    await callback.message.answer("<b>Введите ID пользователя:</b>")
+    await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>")
     await callback.answer()
 
 @router.message(AdminStates.waiting_user_action_id)
@@ -2474,11 +2516,11 @@ async def admin_user_action_id(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
         return
-    try:
-        target_user_id = int(message.text.strip())
-    except Exception:
-        await message.answer("Введите корректный ID числом.")
+    user = resolve_user_input(message.text)
+    if not user:
+        await message.answer("Пользователь не найден. Отправьте ID, @username или сданный номер.")
         return
+    target_user_id = int(user["user_id"])
     data = await state.get_data()
     action = data.get("user_action")
     await state.update_data(target_user_id=target_user_id)
@@ -2552,25 +2594,33 @@ async def admin_user_action_text(message: Message, state: FSMContext):
     await state.clear()
 
 
-
 @router.message(Command("dbsqulite"))
-async def export_db_command(message: Message):
+async def db_sqlite_export(message: Message):
     if not is_admin(message.from_user.id):
         return
-    db.conn.commit()
-    if not Path(DB_PATH).exists():
-        await message.answer("Файл базы данных не найден.")
+    path = Path(DB_PATH)
+    if not path.exists():
+        await message.answer("Файл базы пока не найден.")
         return
-    await message.answer_document(FSInputFile(DB_PATH), caption="<b>🗄 SQLite база данных</b>")
+    await message.answer_document(FSInputFile(path), caption="<b>📦 SQLite база</b>")
 
 @router.message(Command("dblog"))
-async def export_log_command(message: Message):
+async def db_log_export(message: Message):
     if not is_admin(message.from_user.id):
         return
-    if not Path(LOG_PATH).exists():
-        await message.answer("Лог-файл пока не создан.")
+    path = Path("bot.log")
+    if not path.exists():
+        path.write_text("Лог пока пуст.\n", encoding="utf-8")
+    await message.answer_document(FSInputFile(path), caption="<b>🧾 Логи бота</b>")
+
+@router.message(Command("dbusernames"))
+async def export_usernames_cmd(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    await message.answer_document(FSInputFile(LOG_PATH), caption="<b>📄 Логи бота</b>")
+    data = db.export_usernames().strip() or "Нет username."
+    path = Path("usernames.txt")
+    path.write_text(data + ("\n" if not data.endswith("\n") else ""), encoding="utf-8")
+    await message.answer_document(FSInputFile(path), caption="<b>👥 Username пользователей</b>")
 
 @router.message(Command("uploadsqlite"))
 @router.message(Command("dbupload"))
@@ -2578,11 +2628,7 @@ async def db_upload_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.set_state(AdminStates.waiting_db_upload)
-    await message.answer(
-        "<b>📥 Загрузка базы данных</b>\n\n"
-        "Отправьте файлом новую базу <code>bot.db</code> или любой <code>.db</code>/<code>.sqlite</code>.\n"
-        "После загрузки бот сохранит файл и попросит перезапустить сервис."
-    )
+    await message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code> или <code>.sqlite</code>.")
 
 @router.message(AdminStates.waiting_db_upload, F.document)
 async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
@@ -2591,45 +2637,99 @@ async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
         return
     doc = message.document
     name = (doc.file_name or "").lower()
-    if not (name.endswith(".db") or name.endswith(".sqlite") or name == "bot.db"):
-        await message.answer("Отправьте файл базы данных с расширением <code>.db</code> или <code>.sqlite</code>.")
+    if not (name.endswith(".db") or name.endswith(".sqlite")):
+        await message.answer("Пришлите именно файл базы <code>.db</code> или <code>.sqlite</code>.")
         return
     temp_path = Path(DB_PATH + ".uploaded")
     await bot.download(doc, destination=temp_path)
-    # quick validation: open sqlite
     try:
         import sqlite3 as _sqlite3
         conn = _sqlite3.connect(str(temp_path))
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
         conn.close()
     except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        await message.answer("❌ Файл не похож на рабочую SQLite базу.")
+        temp_path.unlink(missing_ok=True)
+        await message.answer("❌ Файл не похож на SQLite базу.")
         return
-
     backup_path = Path(DB_PATH + ".backup")
-    try:
-        if Path(DB_PATH).exists():
-            shutil.copyfile(DB_PATH, backup_path)
-        shutil.move(str(temp_path), DB_PATH)
-    except Exception as e:
-        await message.answer(f"❌ Не удалось заменить базу: <code>{escape(str(e))}</code>")
-        return
-
+    if Path(DB_PATH).exists():
+        shutil.copyfile(DB_PATH, backup_path)
+    shutil.move(str(temp_path), DB_PATH)
     await state.clear()
-    await message.answer(
-        "<b>✅ База данных загружена</b>\n\n"
-        f"Новый файл сохранён как <code>{escape(DB_PATH)}</code>.\n"
-        "Перезапустите Railway, чтобы бот подхватил новую базу.\n"
-        f"Резервная копия старой базы: <code>{escape(str(backup_path))}</code>"
-    )
+    await message.answer("<b>✅ База загружена</b>\n\nПерезапустите Railway, чтобы бот подхватил новую базу.")
 
 @router.message(AdminStates.waiting_db_upload)
-async def db_upload_wait_other(message: Message):
-    await message.answer("Пришлите именно файл базы данных <code>.db</code> или <code>.sqlite</code>.")
+async def db_upload_wrong(message: Message):
+    await message.answer("Пришлите файл базы <code>.db</code> или <code>.sqlite</code>.")
+
+@router.message(Command("stata"))
+async def stata_cmd(message: Message):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Команда работает в рабочей группе.")
+        return
+    rows = db.conn.execute(
+        "SELECT operator_key, "
+        "COUNT(*) as total, "
+        "SUM(CASE WHEN status='taken' THEN 1 ELSE 0 END) as taken, "
+        "SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) as started, "
+        "SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) as errors, "
+        "SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) as slips, "
+        "SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as success, "
+        "SUM(CASE WHEN status='completed' THEN price ELSE 0 END) as total_paid "
+        "FROM queue_items "
+        "WHERE work_chat_id=? GROUP BY operator_key ORDER BY operator_key",
+        (message.chat.id,),
+    ).fetchall()
+    if not rows:
+        await message.answer("<b>📊 Стата группы</b>\n\nПока данных нет.")
+        return
+    lines=[]
+    for r in rows:
+        lines.append(
+            f"{op_text(r['operator_key'])}\n"
+            f"• Взято: <b>{int(r['taken'] or 0)}</b>\n"
+            f"• Встало: <b>{int(r['started'] or 0)}</b>\n"
+            f"• Ошибок: <b>{int(r['errors'] or 0)}</b>\n"
+            f"• Слетов: <b>{int(r['slips'] or 0)}</b>\n"
+            f"• Успешно: <b>{int(r['success'] or 0)}</b>\n"
+            f"• Тотал оплат: <b>{usd(r['total_paid'] or 0)}</b>"
+        )
+    await message.answer("<b>📊 Стата группы</b>\n\n" + "\n\n".join(lines))
+
+@router.callback_query(F.data == "admin:set_withdraw_channel")
+async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
+    if user_role(callback.from_user.id) != "chief_admin":
+        return
+    await state.update_data(channel_target="withdraw_channel_id")
+    await state.set_state(AdminStates.waiting_channel_value)
+    await callback.message.answer("Введите новый <b>ID канала выплат</b>:")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:set_log_channel")
+async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
+    if user_role(callback.from_user.id) != "chief_admin":
+        return
+    await state.update_data(channel_target="log_channel_id")
+    await state.set_state(AdminStates.waiting_channel_value)
+    await callback.message.answer("Введите новый <b>ID канала логов</b>:")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_channel_value)
+async def admin_channel_value(message: Message, state: FSMContext):
+    if user_role(message.from_user.id) != "chief_admin":
+        await state.clear()
+        return
+    raw = message.text.strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("Введите ID канала числом.")
+        return
+    data = await state.get_data()
+    key = data.get("channel_target")
+    db.set_setting(key, raw)
+    await state.clear()
+    await message.answer("✅ Сохранено.")
 
 
 
