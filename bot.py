@@ -16,7 +16,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ReplyKeyboardRemove
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
@@ -43,10 +43,12 @@ CRYPTO_PAY_ASSET = "USDT"
 CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
 
 OPERATORS = {
-    "mts": {"title": "МТС", "price": 4.00, "emoji": "🔴", "command": "/esim"},
-    "bil": {"title": "Билайн", "price": 4.50, "emoji": "🟡", "command": "/esim"},
-    "mega": {"title": "Мегафон", "price": 5.00, "emoji": "🟢", "command": "/esim"},
-    "t2": {"title": "Tele2", "price": 4.20, "emoji": "⚫", "command": "/esim"},
+    "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
+    "bil": {"title": "Билайн", "price": 4.50, "command": "/bil"},
+    "mega": {"title": "Мегафон", "price": 5.00, "command": "/mega"},
+    "t2": {"title": "Tele2", "price": 4.20, "command": "/t2"},
+    "vtb": {"title": "ВТБ", "price": 4.80, "command": "/vtb"},
+    "gaz": {"title": "Газпром", "price": 4.90, "command": "/gaz"},
 }
 # =========================================================
 
@@ -74,6 +76,10 @@ class SubmitStates(StatesGroup):
 
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
+
+class EmojiLookupStates(StatesGroup):
+    waiting_target = State()
+
 
 
 class AdminStates(StatesGroup):
@@ -606,30 +612,6 @@ def my_numbers_kb(items):
     return kb.as_markup()
 
 
-def operator_display(key: str) -> str:
-    return f"{OPERATORS[key].get('emoji', '📱')} {OPERATORS[key]['title']}"
-
-
-def operator_price(key: str, mode: str) -> float:
-    default = float(OPERATORS[key]['price'])
-    suffix = 'hold' if mode == 'hold' else 'no_hold'
-    return float(db.get_setting(f"price_{key}_{suffix}", str(default)))
-
-
-def queue_position(item_id: int) -> int:
-    row = db.conn.execute(
-        "SELECT operator_key, mode FROM queue_items WHERE id=?",
-        (item_id,),
-    ).fetchone()
-    if not row:
-        return 0
-    row2 = db.conn.execute(
-        "SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' AND id<=?",
-        (row['operator_key'], row['mode'], item_id),
-    ).fetchone()
-    return int(row2['c'] or 0)
-
-
 def cancel_inline_kb(back: str = "menu:home"):
     kb = InlineKeyboardBuilder()
     kb.button(text="❌ Отмена", callback_data=back)
@@ -637,13 +619,13 @@ def cancel_inline_kb(back: str = "menu:home"):
     return kb.as_markup()
 
 
-def operators_kb(mode: str = "hold", prefix: str = "op"):
+def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:back"):
     kb = InlineKeyboardBuilder()
-    back_cb = "mode:back" if prefix == "op" else "esim_mode:back"
+    labels = {"mts": "🟥 МТС", "bil": "🟨 Билайн", "mega": "🟩 Мегафон", "t2": "⬛ Tele2", "vtb": "🟦 ВТБ", "gaz": "🔷 Газпром"}
     for key in OPERATORS:
         q = count_waiting_mode(key, mode)
-        price = operator_price(key, mode)
-        kb.button(text=f"{operator_display(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+        price = get_mode_price(key, mode)
+        kb.button(text=f"{labels.get(key, OPERATORS[key]['title'])} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
@@ -690,11 +672,7 @@ def confirm_withdraw_kb(amount: float):
 
 
 def withdraw_back_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="↩️ Назад", callback_data="menu:withdraw")
-    kb.adjust(1)
-    return kb.as_markup()
-
+    return None
 
 
 def withdraw_admin_kb(withdraw_id: int):
@@ -867,16 +845,20 @@ def render_start(user_id: int) -> str:
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
     description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
     price_lines = [
-        f"🔺 <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
-        f"🔸 <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
-        f"▫️ <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
-        f"▪️ <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
+        f"🟥 <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold'))}</b> / <b>{usd(get_mode_price('mts', 'no_hold'))}</b>",
+        f"🟨 <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold'))}</b> / <b>{usd(get_mode_price('bil', 'no_hold'))}</b>",
+        f"🟩 <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold'))}</b> / <b>{usd(get_mode_price('mega', 'no_hold'))}</b>",
+        f"⬛ <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold'))}</b> / <b>{usd(get_mode_price('t2', 'no_hold'))}</b>",
+        f"🟦 <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold'))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold'))}</b>",
+        f"🔷 <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold'))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold'))}</b>",
     ]
     queue_lines = [
-        f"🔺 <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
-        f"🔸 <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
-        f"▫️ <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
-        f"▪️ <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
+        f"🟥 <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
+        f"🟨 <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
+        f"🟩 <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
+        f"⬛ <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
+        f"🟦 <b>ВТБ:</b> {count_waiting_mode('vtb', 'hold')} / {count_waiting_mode('vtb', 'no_hold')}",
+        f"🔷 <b>Газпром:</b> {count_waiting_mode('gaz', 'hold')} / {count_waiting_mode('gaz', 'no_hold')}",
     ]
     return (
         f"<b>💫 {title} 💫</b>\n"
@@ -949,28 +931,18 @@ def render_my_numbers(user_id: int) -> str:
         body = "• За сегодня заявок пока нет."
     else:
         rows = []
-        status_map = {
-            'queued': 'в очереди',
-            'taken': 'взята',
-            'in_progress': 'в работе',
-            'completed': 'оплачена',
-            'failed': 'ошибка',
-            'slipped': 'слет',
-            'user_removed': 'убрана',
-            'admin_removed': 'убрана',
-        }
         for row in items[:10]:
-            pos = queue_position(int(row['id'])) if row['status'] == 'queued' else 0
-            pos_text = f" • позиция: {pos}" if pos else ""
-            rows.append(f"#{row['id']} • {OPERATORS[row['operator_key']]['title']} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])}{pos_text} • <b>{status_map.get(row['status'], row['status'])}</b>")
+            pos = queue_position(row['id']) if row['status'] == 'queued' else None
+            pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
+            rows.append(
+                f"#{row['id']} • {OPERATORS[row['operator_key']]['title']} • {mode_label(row['mode'])} • {pretty_phone(row['normalized_phone'])} • <b>{row['status']}</b>{pos_text}"
+            )
         body = "\n".join(rows)
     return (
         "<b>📦 Мои номера — сегодня</b>\n\n"
         + quote_block([body])
-        + "\n\n<i>Здесь можно посмотреть свои заявки за день, увидеть позицию в очереди и убрать из очереди те, что ещё не взяты в работу.</i>"
+        + "\n\n<i>Здесь можно посмотреть свои заявки за день и убрать из очереди те, что ещё не взяты в работу.</i>"
     )
-
-
 
 def render_admin_home() -> str:
     return (
@@ -1196,6 +1168,17 @@ def user_today_queue_items(user_id: int):
     ).fetchall()
 
 
+def queue_position(item_id: int):
+    row = db.conn.execute("SELECT operator_key, mode, status FROM queue_items WHERE id=?", (item_id,)).fetchone()
+    if not row or row['status'] != 'queued':
+        return None
+    pos = db.conn.execute(
+        "SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' AND id <= ?",
+        (row['operator_key'], row['mode'], item_id),
+    ).fetchone()
+    return int((pos['c'] if pos else 0) or 0)
+
+
 def remove_queue_item(item_id: int, reason: str = 'removed', admin_id: int | None = None):
     db.conn.execute("UPDATE queue_items SET status='failed', fail_reason=?, completed_at=? WHERE id=? AND status='queued'", (reason, now_str(), item_id))
     db.conn.commit()
@@ -1372,24 +1355,6 @@ async def profile_view(message: Message, state: FSMContext):
     await send_banner_message(message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(message.from_user.id), kb.as_markup())
 
 
-@router.message(F.text == "📲 Сдать номер")
-async def submit_start(message: Message, state: FSMContext):
-    await remove_reply_keyboard(message)
-    if is_user_blocked(message.from_user.id):
-        await message.answer(blocked_text())
-        return
-    if not is_numbers_enabled():
-        await message.answer("<b>⛔ Сдача номеров временно выключена.</b>")
-        return
-    await state.set_state(SubmitStates.waiting_mode)
-    await send_banner_message(
-        message,
-        db.get_setting('start_banner_path', START_BANNER),
-        "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:",
-        mode_kb(),
-    )
-
-
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
     if is_user_blocked(callback.from_user.id):
@@ -1406,9 +1371,9 @@ async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "mode:back")
 async def mode_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+    text = "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:"
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), text, mode_inline_kb())
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("mode:"))
 async def choose_mode(callback: CallbackQuery, state: FSMContext):
@@ -1455,7 +1420,7 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
         callback,
         db.get_setting('start_banner_path', START_BANNER),
         "<b>💫 ESIM Service X 💫</b>\n\n<b>📨 Отправьте QR-код - Фото сообщением</b>\n\n👉 <b>Требуется:</b>\n▫️ Фото QR\n▫️ В подписи укажите номер\n\n🔰 <b>Допустимый формат номера:</b>\n<blockquote>+79991234567  «+7»\n79991234567   «7»\n89991234567   «8»</blockquote>\n\nЕсли передумали нажмите ниже - Отмена",
-        cancel_inline_kb("menu:home"),
+        cancel_inline_kb("op:back"),
     )
     await callback.answer()
 
@@ -1473,7 +1438,7 @@ async def submit_qr(message: Message, state: FSMContext):
     if not phone:
         await message.answer(
             "⚠️ Номер должен быть только в формате:\n<code>+79991234567</code>\n<code>79991234567</code>\n<code>89991234567</code>",
-            reply_markup=cancel_inline_kb("op:back"),
+            reply_markup=cancel_menu(),
         )
         return
     data = await state.get_data()
@@ -1511,7 +1476,7 @@ async def submit_qr(message: Message, state: FSMContext):
 
 @router.message(SubmitStates.waiting_qr)
 async def submit_not_photo(message: Message):
-    await message.answer("<b>⚠️ Отправьте именно фото QR-кода с подписью-номером.</b>", reply_markup=cancel_inline_kb("op:back"))
+    await message.answer("<b>⚠️ Отправьте именно фото QR-кода с подписью-номером.</b>", reply_markup=cancel_menu())
 
 
 @router.message(F.text == "💸 Вывод средств")
@@ -2032,415 +1997,73 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
 
 
 @router.message(Command("mts", "mtc", "bil", "mega", "t2"))
-async def old_operator_commands(message: Message):
-    await message.answer("<b>ℹ️ Команды отдельных операторов отключены.</b>\n\nИспользуйте <code>/esim</code> и выберите режим + оператора кнопками.")
-
-
-@router.message(Command("stata", "Stata"))
-async def stata_cmd(message: Message):
+async def legacy_take_commands(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
-    thread_id = getattr(message, "message_thread_id", None)
-    group = db.group_stats(message.chat.id, thread_id)
-    queue_lines = [f"• {data['title']}: {db.count_waiting(key)}" for key, data in OPERATORS.items()]
-    await message.answer(
-        "<b>📊 Статистика рабочей зоны</b>\n\n"
-        f"📤 Очередь по операторам:\n" + "\n".join(queue_lines) + "\n\n"
-        f"📥 В группе взято: <b>{int(group['taken_total'] or 0)}</b>\n"
-        f"✅ Встало: <b>{int(group['started'] or 0)}</b>\n"
-        f"⚠️ Ошибок: <b>{int(group['errors'] or 0)}</b>\n"
-        f"❌ Слетов: <b>{int(group['slips'] or 0)}</b>\n"
-        f"💎 Успешно: <b>{int(group['success'] or 0)}</b>\n"
-        f"💵 Тотал оплат: <b>{usd(group['paid_total'] or 0)}</b>"
-    )
+    await message.answer("Команды /mts /bil /mega /t2 отключены. Используй <b>/esim</b>.")
 
 
-@router.callback_query(F.data.startswith("error_pre:"))
-async def error_pre(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    item_id = int(callback.data.split(":", 1)[1])
-    item = db.get_queue_item(item_id)
-    if not item or item.status not in {"queued", "taken"}:
-        await callback.answer("Действие уже недоступно", show_alert=True)
-        return
-    db.mark_error_before_start(item_id)
-    db.add_balance(item.user_id, 0)
-    await notify_user(
-        callback.bot,
-        item.user_id,
-        "<b>⚠️ Заявка отмечена как ошибка</b>\n\n"
-        f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        "Номер не принят в работу.",
-    )
-    await callback.message.edit_caption(caption=queue_caption(item) + "\n\n⚠️ Отмечено как ошибка до старта.", reply_markup=None)
-    await callback.answer("Помечено как ошибка")
 
+def extract_custom_emoji_ids(message: Message) -> list[str]:
+    ids = []
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for ent in entities:
+        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            ids.append(ent.custom_emoji_id)
+    return ids
 
-@router.callback_query(F.data.startswith("take_start:"))
-async def take_start(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    item_id = int(callback.data.split(":", 1)[1])
-    item = db.get_queue_item(item_id)
-    if not item:
-        await callback.answer("Заявка не найдена", show_alert=True)
-        return
-    if item.status in {"in_progress", "completed", "failed"}:
-        await callback.answer("По этой заявке действие уже выполнено", show_alert=True)
-        return
-    db.start_work(item_id, callback.from_user.id, item.mode, callback.message.chat.id, getattr(callback.message, 'message_thread_id', None), callback.message.message_id)
-    item = db.get_queue_item(item_id)
-    await notify_user(
-        callback.bot,
-        item.user_id,
-        "<b>🚀 По вашему номеру началась работа</b>\n\n"
-        f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        f"📱 Оператор: <b>{OPERATORS[item.operator_key]['title']}</b>\n"
-        + (f"⏳ Холд: <b>{db.get_setting('hold_minutes')} мин.</b>" if item.mode == 'hold' else "⚡ Режим: <b>БезХолд</b>"),
-    )
-    await callback.message.edit_caption(caption=queue_caption(item), reply_markup=admin_queue_kb(item))
-    await callback.answer("Работа началась")
+def build_sticker_info_lines(sticker=None, custom_ids=None):
+    lines = []
+    if sticker:
+        lines.append(f"<b>file_id:</b> <code>{sticker.file_id}</code>")
+        lines.append(f"<b>file_unique_id:</b> <code>{sticker.file_unique_id}</code>")
+        if getattr(sticker, 'set_name', None):
+            lines.append(f"<b>set_name:</b> <code>{sticker.set_name}</code>")
+        if getattr(sticker, 'emoji', None):
+            lines.append(f"<b>emoji:</b> {escape(sticker.emoji)}")
+        if getattr(sticker, 'custom_emoji_id', None):
+            lines.append(f"<b>custom_emoji_id:</b> <code>{sticker.custom_emoji_id}</code>")
+        if getattr(sticker, 'is_animated', None) is not None:
+            lines.append(f"<b>animated:</b> <code>{sticker.is_animated}</code>")
+        if getattr(sticker, 'is_video', None) is not None:
+            lines.append(f"<b>video:</b> <code>{sticker.is_video}</code>")
+    for cid in custom_ids or []:
+        lines.append(f"<b>custom_emoji_id:</b> <code>{cid}</code>")
+    return lines
 
-
-@router.callback_query(F.data.startswith("instant_pay:"))
-async def instant_pay(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    item_id = int(callback.data.split(":", 1)[1])
-    item = db.get_queue_item(item_id)
-    if not item or item.status != "in_progress" or item.mode != "no_hold":
-        await callback.answer("Оплата доступна только для режима БезХолд после старта.", show_alert=True)
-        return
-    db.complete_queue_item(item_id)
-    db.add_balance(item.user_id, item.price)
-    await notify_user(
-        callback.bot,
-        item.user_id,
-        "<b>✅ Номер успешно принят</b>\n\n"
-        f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        f"💰 Начислено: <b>{usd(item.price)}</b>",
-    )
-    await callback.message.edit_caption(caption=queue_caption(item) + "\n\n✅ Номер оплачен.", reply_markup=None)
-    await callback.answer("Оплачено")
-
-
-@router.callback_query(F.data.startswith("slip:"))
-async def slip_item(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    item_id = int(callback.data.split(":", 1)[1])
-    item = db.get_queue_item(item_id)
-    if not item or item.status != "in_progress":
-        await callback.answer("Кнопка «Слет» доступна только после «Встал».", show_alert=True)
-        return
-    db.fail_after_start(item_id, "slip")
-    item = db.get_queue_item(item_id)
-    await notify_user(
-        callback.bot,
-        item.user_id,
-        "<b>❌ Номер слетел</b>\n\n"
-        f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        f"⏱ Время работы: <b>{calc_work_time(item.work_started_at)}</b>\n\n"
-        "Оплата за номер не начислена.",
-    )
-    await callback.message.edit_caption(
-        caption=queue_caption(item) + f"\n\n❌ Отмечено как слет\n⏱ Время работы: <b>{calc_work_time(item.work_started_at)}</b>",
-        reply_markup=cancel_inline_kb("menu:home"),
-    )
-    await callback.answer("Помечено как слет")
-
-
-@router.callback_query(F.data.startswith("wd_ok:"))
-async def wd_ok(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    wd_id = int(callback.data.split(":", 1)[1])
-    wd = db.get_withdrawal(wd_id)
-    if not wd or wd["status"] != "pending":
-        await callback.answer("Заявка уже обработана", show_alert=True)
-        return
-    if db.get_treasury() < wd["amount"]:
-        await callback.answer("В казне недостаточно средств", show_alert=True)
-        return
-    check_id, check_url, note = await create_crypto_check(float(wd["amount"]), wd["user_id"])
-    db.subtract_treasury(float(wd["amount"]))
-    db.conn.execute("UPDATE withdrawals SET payout_check_id=? WHERE id=?", (check_id, wd_id))
-    db.conn.commit()
-    db.set_withdrawal_status(wd_id, "approved", callback.from_user.id, payout_check=check_url, payout_note=note)
-    if check_url:
-        payout_text = f"🎟 Чек: {check_url}"
-    else:
-        payout_text = "🎟 Чек не создан автоматически. Проверь токен Crypto Pay API."
-    await notify_user(
-        callback.bot,
-        wd["user_id"],
-        "<b>✅ Заявка на вывод одобрена</b>\n\n"
-        f"💸 Сумма: <b>{usd(wd['amount'])}</b>\n"
-        f"{escape(payout_text)}\n"
-        f"📝 {escape(note)}",
-    )
-    await callback.message.edit_text((callback.message.text or "") + f"\n\n✅ Одобрено\n{escape(payout_text)}\n🏦 Остаток казны: <b>{usd(db.get_treasury())}</b>")
-    await callback.answer("Одобрено")
-
-
-@router.callback_query(F.data.startswith("wd_no:"))
-async def wd_no(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    wd_id = int(callback.data.split(":", 1)[1])
-    wd = db.get_withdrawal(wd_id)
-    if not wd or wd["status"] != "pending":
-        await callback.answer("Заявка уже обработана", show_alert=True)
-        return
-    db.set_withdrawal_status(wd_id, "rejected", callback.from_user.id, payout_note="rejected by admin")
-    db.add_balance(wd["user_id"], float(wd["amount"]))
-    await notify_user(callback.bot, wd["user_id"], f"<b>❌ Заявка на вывод отклонена</b>\n\n💸 Сумма возвращена: <b>{usd(wd['amount'])}</b>")
-    await callback.message.edit_text((callback.message.text or "") + "\n\n❌ Отклонено")
-    await callback.answer("Отклонено")
-
-
-def calc_work_time(started_at: Optional[str]) -> str:
-    start = parse_dt(started_at)
-    if not start:
-        return "00:00"
-    diff = msk_now() - start
-    total = int(diff.total_seconds())
-    minutes = total // 60
-    seconds = total % 60
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-async def hold_watcher(bot: Bot):
-    while True:
-        try:
-            for item in db.get_expired_holds():
-                db.complete_queue_item(item.id)
-                db.add_balance(item.user_id, item.price)
-                try:
-                    await bot.edit_message_caption(
-                        chat_id=item.work_chat_id,
-                        message_id=item.work_message_id,
-                        caption=queue_caption(db.get_queue_item(item.id)) + "\n\n✅ Холд завершён. Номер успешно оплачен.",
-                        reply_markup=cancel_inline_kb("menu:home"),
-                    )
-                except Exception:
-                    pass
-                await notify_user(
-                    bot,
-                    item.user_id,
-                    "<b>✅ Номер успешно засчитан</b>\n\n"
-                    f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-                    f"💰 Начислено: <b>{usd(item.price)}</b>",
-                )
-            for item in db.get_active_holds_for_render():
-                rendered = parse_dt(item.timer_last_render)
-                if rendered and (msk_now() - rendered).total_seconds() < 30:
-                    continue
-                try:
-                    fresh = db.get_queue_item(item.id)
-                    if fresh and fresh.status == "in_progress":
-                        await bot.edit_message_caption(
-                            chat_id=fresh.work_chat_id,
-                            message_id=fresh.work_message_id,
-                            caption=queue_caption(fresh),
-                            reply_markup=admin_queue_kb(fresh),
-                        )
-                        db.touch_timer_render(fresh.id)
-                except Exception:
-                    pass
-        except Exception:
-            logging.exception("hold_watcher error")
-        await asyncio.sleep(5)
-
-
-@router.callback_query(F.data == "admin:queues")
-async def admin_queues(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_text("<b>📦 Управление очередью</b>\n\nУбрать можно только заявки со статусом «в очереди».", reply_markup=queue_manage_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin:queue_remove:"))
-async def admin_queue_remove(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    item_id = int(callback.data.split(":")[-1])
-    item = db.get_queue_item(item_id)
-    if not item or item.status != 'queued':
-        await callback.answer("Убрать можно только заявку из очереди", show_alert=True)
-        return
-    remove_queue_item(item_id, 'admin_removed', callback.from_user.id)
-    await callback.answer("Заявка убрана")
-    await callback.message.edit_text("<b>📦 Управление очередью</b>\n\nУбрать можно только заявки со статусом «в очереди».", reply_markup=queue_manage_kb())
-
-
-@router.callback_query(F.data.startswith("myremove:"))
-async def my_remove(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[-1])
-    item = db.get_queue_item(item_id)
-    if not item or item.user_id != callback.from_user.id or item.status != 'queued':
-        await callback.answer("Эту заявку уже нельзя убрать", show_alert=True)
-        return
-    remove_queue_item(item_id, 'user_removed', callback.from_user.id)
-    items = user_today_queue_items(callback.from_user.id)
-    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
-    await callback.answer("Номер убран из очереди")
-
-
-@router.callback_query(F.data == "admin:user_tools")
-async def admin_user_tools(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_text("<b>👤 Инструменты пользователя</b>\n\nВыберите нужное действие.", reply_markup=user_admin_kb())
-    await callback.answer()
-
-
-async def _ask_user_id(callback: CallbackQuery, state: FSMContext, action: str, prompt: str):
-    await state.set_state(AdminStates.waiting_user_action_id)
-    await state.update_data(user_action=action)
-    await callback.message.answer(prompt)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:user_stats")
-async def admin_user_stats(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'stats', 'Отправьте ID пользователя для просмотра статистики:')
-
-
-@router.callback_query(F.data == "admin:user_pm")
-async def admin_user_pm(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'pm', 'Отправьте ID пользователя, которому нужно написать в ЛС:')
-
-
-@router.callback_query(F.data == "admin:user_add_balance")
-async def admin_user_add_balance(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'add_balance', 'Отправьте ID пользователя для начисления денег:')
-
-
-@router.callback_query(F.data == "admin:user_sub_balance")
-async def admin_user_sub_balance(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'sub_balance', 'Отправьте ID пользователя для снятия денег:')
-
-
-@router.callback_query(F.data == "admin:user_ban")
-async def admin_user_ban(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'ban', 'Отправьте ID пользователя для блокировки:')
-
-
-@router.callback_query(F.data == "admin:user_unban")
-async def admin_user_unban(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await _ask_user_id(callback, state, 'unban', 'Отправьте ID пользователя для разблокировки:')
-
-
-@router.callback_query(F.data == "admin:toggle_numbers")
-async def admin_toggle_numbers(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    set_numbers_enabled(not is_numbers_enabled())
-    await callback.message.edit_text(render_admin_home(), reply_markup=admin_root_kb())
-    await callback.answer("Статус приёма обновлён")
-
-
-@router.message(AdminStates.waiting_user_action_id)
-async def admin_user_action_id(message: Message, state: FSMContext):
+@router.message(Command("stickerid"))
+@router.message(Command("emojiid"))
+async def stickerid_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    try:
-        target_id = int((message.text or '').strip())
-    except Exception:
-        await message.answer('Нужен числовой ID.')
+    sticker = None
+    custom_ids = []
+    target = message.reply_to_message or message
+    if getattr(target, 'sticker', None):
+        sticker = target.sticker
+    custom_ids.extend(extract_custom_emoji_ids(target))
+    if sticker or custom_ids:
+        lines = build_sticker_info_lines(sticker, custom_ids)
+        await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
         return
-    data = await state.get_data()
-    action = data.get('user_action')
-    await state.update_data(target_user_id=target_id)
-    if action == 'stats':
+    await state.set_state(EmojiLookupStates.waiting_target)
+    await message.answer("<b>🎟 Emoji ID режим</b>\n\nОтправь <b>премиум-стикер</b> или сообщение с <b>premium emoji</b>, и я покажу ID.")
+
+@router.message(EmojiLookupStates.waiting_target)
+async def emoji_lookup_waiting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         await state.clear()
-        await message.answer(find_user_text(target_id), reply_markup=admin_root_kb())
-    elif action in {'ban','unban'}:
-        set_user_blocked(target_id, action == 'ban')
-        await state.clear()
-        await message.answer('✅ Готово.', reply_markup=admin_root_kb())
-    elif action in {'add_balance','sub_balance'}:
-        await state.set_state(AdminStates.waiting_user_action_value)
-        await message.answer('Введите сумму в $:')
-    elif action == 'pm':
-        await state.set_state(AdminStates.waiting_user_action_text)
-        await message.answer('Отправьте текст сообщения для пользователя:')
-
-
-@router.message(AdminStates.waiting_user_action_value)
-async def admin_user_action_value(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
         return
-    try:
-        amount = float((message.text or '').replace(',', '.'))
-    except Exception:
-        await message.answer('Введите сумму числом.')
+    sticker = message.sticker if getattr(message, 'sticker', None) else None
+    custom_ids = extract_custom_emoji_ids(message)
+    if not sticker and not custom_ids:
+        await message.answer("Пришли <b>стикер</b> или сообщение с <b>premium emoji</b>.")
         return
-    data = await state.get_data()
-    target_id = int(data.get('target_user_id'))
-    action = data.get('user_action')
-    if action == 'add_balance':
-        db.add_balance(target_id, amount)
-    else:
-        db.subtract_balance(target_id, amount)
+    lines = build_sticker_info_lines(sticker, custom_ids)
     await state.clear()
-    await message.answer('✅ Баланс обновлён.', reply_markup=admin_root_kb())
-
-
-@router.message(AdminStates.waiting_user_action_text)
-async def admin_user_action_text(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    target_id = int(data.get('target_user_id'))
-    try:
-        await message.bot.send_message(target_id, message.html_text or message.text or '')
-        await message.answer('✅ Сообщение отправлено.', reply_markup=admin_root_kb())
-    except Exception:
-        await message.answer('❌ Не удалось отправить сообщение.')
-    await state.clear()
-
-
-@router.message(Command("stickerid", "emojiid"))
-async def sticker_id_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    src = message.reply_to_message or message
-    sticker = src.sticker
-    if not sticker:
-        await message.answer("Ответьте командой на стикер: <code>/stickerid</code>")
-        return
-    custom = getattr(sticker, 'custom_emoji_id', None) or '—'
-    await message.answer(
-        "<b>🧩 Данные стикера</b>\n\n"
-        f"<b>file_id:</b> <code>{html.escape(sticker.file_id)}</code>\n"
-        f"<b>file_unique_id:</b> <code>{html.escape(sticker.file_unique_id)}</code>\n"
-        f"<b>custom_emoji_id:</b> <code>{html.escape(str(custom))}</code>"
-    )
-
-
+    await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
 @router.message(Command("esim"))
+
 async def esim_command(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
@@ -2458,20 +2081,12 @@ async def esim_command(message: Message):
     await message.answer('<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:', reply_markup=esim_mode_kb())
 
 
-@router.callback_query(F.data == "esim_mode:back")
-async def esim_mode_back(callback: CallbackQuery):
+@router.callback_query(F.data == "esim:back_mode")
+async def esim_back_mode(callback: CallbackQuery):
     if not is_operator_or_admin(callback.from_user.id):
         return
     text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
-    try:
-        if getattr(callback.message, 'text', None):
-            await callback.message.edit_text(text, reply_markup=esim_mode_kb())
-        elif getattr(callback.message, 'caption', None) is not None:
-            await callback.message.edit_caption(caption=text, reply_markup=esim_mode_kb())
-        else:
-            await callback.message.answer(text, reply_markup=esim_mode_kb())
-    except Exception:
-        await callback.message.answer(text, reply_markup=esim_mode_kb())
+    await safe_edit_or_send(callback, text, reply_markup=esim_mode_kb())
     await callback.answer()
 
 
@@ -2480,16 +2095,8 @@ async def esim_choose_mode(callback: CallbackQuery):
     if not is_operator_or_admin(callback.from_user.id):
         return
     mode = callback.data.split(':', 1)[1]
-    text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:"
-    try:
-        if getattr(callback.message, 'text', None):
-            await callback.message.edit_text(text, reply_markup=operators_kb(mode, 'esim_take'))
-        elif getattr(callback.message, 'caption', None) is not None:
-            await callback.message.edit_caption(caption=text, reply_markup=operators_kb(mode, 'esim_take'))
-        else:
-            await callback.message.answer(text, reply_markup=operators_kb(mode, 'esim_take'))
-    except Exception:
-        await callback.message.answer(text, reply_markup=operators_kb(mode, 'esim_take'))
+    text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:\n<i>Цена указана прямо в кнопках.</i>"
+    await safe_edit_or_send(callback, text, reply_markup=operators_kb(mode, 'esim_take', 'esim:back_mode'))
     await callback.answer()
 
 
@@ -2514,11 +2121,13 @@ async def esim_take(callback: CallbackQuery):
     fresh = db.get_queue_item(item.id)
     photo = fresh.qr_file_id
     await callback.message.answer_photo(photo, caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
-    await notify_user(
-        callback.bot,
-        fresh.user_id,
-        f"<b>📥 Номер взят в обработку</b>\n\n📞 <b>Номер:</b> {pretty_phone(fresh.normalized_phone)}\n{operator_display(fresh.operator_key)}\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}\n🧾 <b>ID заявки:</b> #{fresh.id}",
-    )
+    try:
+        await callback.bot.send_message(
+            fresh.user_id,
+            f"<b>📥 Номер взят в обработку</b>\n\n🧾 <b>Заявка:</b> #{fresh.id}\n📱 <b>Оператор:</b> {OPERATORS[fresh.operator_key]['title']}\n📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}"
+        )
+    except Exception:
+        pass
     await callback.answer('Заявка выдана')
 
 
