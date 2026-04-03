@@ -61,7 +61,7 @@ MY_NUMBERS_BANNER = "my_numbers_banner.jpg"
 WITHDRAW_BANNER = "withdraw_banner.jpg"
 MSK_OFFSET = timedelta(hours=3)
 
-logging.basicConfig(level=logging.INFO, filename="bot.log", filemode="a", format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", mode="a", encoding="utf-8")])
 router = Router()
 
 LIVE_MIRROR_TASKS = {}
@@ -2501,6 +2501,7 @@ async def admin_workspaces(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin:group_stats_panel")
 async def admin_group_stats_panel(callback: CallbackQuery):
+    logging.info("admin_group_stats_panel opened by %s", callback.from_user.id)
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, "<b>📈 Выберите группу / топик для статистики:</b>", reply_markup=group_stats_list_kb())
@@ -2508,6 +2509,7 @@ async def admin_group_stats_panel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin:groupstat:"))
 async def admin_groupstat_open(callback: CallbackQuery):
+    logging.info("admin_groupstat_open: %s", callback.data)
     if not is_admin(callback.from_user.id):
         return
     _, _, chat_id, thread_id = callback.data.split(":")
@@ -3092,13 +3094,6 @@ async def wd_delcheck(callback: CallbackQuery):
     await callback.answer(note, show_alert=not ok)
 
 
-@router.message()
-async def track_any_message(message: Message):
-    if message.from_user:
-        touch_user(message.from_user.id, message.from_user.username or '', message.from_user.full_name)
-
-
-
 
 async def mirror_polling_loop(bot: Bot):
     offset = 0
@@ -3414,6 +3409,8 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_user_stats_lookup)
 async def admin_user_stats_lookup(message: Message, state: FSMContext):
+    logging.info("admin_user_stats_lookup: %s", message.text)
+    logging.info("user-section handler: stats | text=%s | user=%s", getattr(message if 'stats' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'stats' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -3448,6 +3445,8 @@ async def admin_user_stats_lookup(message: Message, state: FSMContext):
 
 @router.message(AdminStates.waiting_user_price_lookup)
 async def admin_user_price_lookup(message: Message, state: FSMContext):
+    logging.info("admin_user_price_lookup: %s", message.text)
+    logging.info("user-section handler: lookup | text=%s | user=%s", getattr(message if 'lookup' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'lookup' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -3477,6 +3476,8 @@ async def admin_user_price_back_ops(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin:user_price_op:"))
 async def admin_user_price_op(callback: CallbackQuery):
+    logging.info("admin_user_price_op: %s", callback.data)
+    logging.info("user-section handler: op | text=%s | user=%s", getattr(message if 'op' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'op' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(callback.from_user.id):
         return
     _, _, _, uid, operator_key = callback.data.split(":")
@@ -3489,6 +3490,8 @@ async def admin_user_price_op(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin:user_price_mode:"))
 async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
+    logging.info("admin_user_price_mode: %s", callback.data)
+    logging.info("user-section handler: mode | text=%s | user=%s", getattr(message if 'mode' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'mode' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(callback.from_user.id):
         return
     _, _, _, uid, operator_key, mode = callback.data.split(":")
@@ -3505,6 +3508,8 @@ async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_user_price_value)
 async def admin_user_price_value(message: Message, state: FSMContext):
+    logging.info("admin_user_price_value: %s", message.text)
+    logging.info("user-section handler: value | text=%s | user=%s", getattr(message if 'value' not in ["op","mode"] else callback, "text", None) if False else None, (message.from_user.id if 'value' not in ["op","mode"] else callback.from_user.id))
     if not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -3706,6 +3711,15 @@ async def admin_channel_value(message: Message, state: FSMContext):
     await message.answer("✅ Сохранено.")
 
 
+
+
+@router.message()
+async def track_any_message(message: Message):
+    try:
+        if message.from_user:
+            touch_user(message.from_user.id, message.from_user.username or '', message.from_user.full_name)
+    except Exception:
+        logging.exception("track_any_message failed")
 
 
 async def main():
