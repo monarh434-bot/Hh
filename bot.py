@@ -338,7 +338,7 @@ class Database:
                 pretty_phone(normalized_phone),
                 normalized_phone,
                 qr_file_id,
-                self.get_operator_price(operator_key),
+                get_mode_price(operator_key, mode),
                 now_str(),
                 mode,
             ),
@@ -2148,6 +2148,63 @@ async def wd_delcheck(callback: CallbackQuery):
 async def track_any_message(message: Message):
     if message.from_user:
         touch_user(message.from_user.id, message.from_user.username or '', message.from_user.full_name)
+
+
+
+async def hold_watcher(bot: Bot):
+    while True:
+        try:
+            # update active hold captions every ~30 sec
+            active_items = db.get_active_holds_for_render()
+            for item in active_items:
+                try:
+                    if item.status != "in_progress":
+                        continue
+                    last = parse_dt(item.timer_last_render) if item.timer_last_render else None
+                    now_dt = msk_now()
+                    if last is None or (now_dt - last).total_seconds() >= 30:
+                        await bot.edit_message_caption(
+                            chat_id=item.work_chat_id,
+                            message_id=item.work_message_id,
+                            caption=queue_caption(item),
+                            reply_markup=admin_queue_kb(item),
+                        )
+                        db.touch_timer_render(item.id)
+                except Exception:
+                    pass
+
+            # complete expired holds
+            expired_items = db.get_expired_holds()
+            for item in expired_items:
+                try:
+                    db.complete_queue_item(item.id)
+                    db.add_balance(item.user_id, float(item.price))
+                    fresh_user = db.get_user(item.user_id)
+                    balance = float(fresh_user["balance"] if fresh_user else 0.0)
+                    try:
+                        await bot.send_message(
+                            item.user_id,
+                            "<b>✅ Оплата за номер</b>\n\n"
+                            f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
+                            f"💰 <b>Начислено:</b> {usd(item.price)}\n"
+                            f"💲 <b>Ваш баланс:</b> {usd(balance)}"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=item.work_chat_id,
+                            message_id=item.work_message_id,
+                            caption=queue_caption(db.get_queue_item(item.id) or item) + "\n\n✅ <b>Холд завершён. Номер оплачен.</b>",
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("hold_watcher failed")
+        await asyncio.sleep(5)
 
 
 async def main():
