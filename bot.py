@@ -1929,7 +1929,14 @@ def queue_item_submit_token(item) -> str:
     return (token or BOT_TOKEN).strip() or BOT_TOKEN
 
 async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
-    uid = int(getattr(item, 'user_id', item['user_id']))
+    if hasattr(item, 'user_id'):
+        uid_raw = getattr(item, 'user_id')
+    elif hasattr(item, 'keys') and 'user_id' in item.keys():
+        uid_raw = item['user_id']
+    else:
+        raise ValueError(f"queue item has no user_id: {type(item)!r}")
+
+    uid = int(uid_raw)
     submit_token = queue_item_submit_token(item)
     plain = re.sub(r'</?tg-emoji[^>]*>', '', text)
     plain = re.sub(r'<[^>]+>', '', plain)
