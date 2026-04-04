@@ -1003,6 +1003,18 @@ def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:ba
     kb.adjust(1)
     return kb.as_markup()
 
+
+def operators_group_kb(chat_id: int, thread_id: int | None, mode: str = "hold", prefix: str = "esim_take", back_cb: str = "esim:back_mode"):
+    kb = InlineKeyboardBuilder()
+    for key in OPERATORS:
+        q = count_waiting_mode(key, mode)
+        price = group_price_for_take(chat_id, thread_id, key, mode)
+        prefix_mark = "🚫 " if not is_operator_mode_enabled(key, mode) else ""
+        kb.button(text=f"{prefix_mark}{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+    kb.button(text="↩️ Назад", callback_data=back_cb)
+    kb.adjust(1)
+    return kb.as_markup()
+
 def esim_mode_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="⏳ Холд", callback_data="esim_mode:hold")
@@ -1337,9 +1349,11 @@ def queue_caption(item: QueueItem) -> str:
         f"👤 От: <b>{escape(item.full_name)}</b>\n"
         f"🆔 ID: <code>{item.user_id}</code>\n"
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        f"💰 Цена: <b>{usd(item.price)}</b>\n"
+        f"💰 Цена для сдающего: <b>{usd(item.price)}</b>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
+    if getattr(item, 'charge_amount', None) not in (None, 0, 0.0):
+        text += f"\n🏷 Прайс группы: <b>{usd(float(item.charge_amount))}</b>"
     if item.status == "in_progress":
         text += "\n\n🚀 <b>Работа началась</b>"
         if item.mode == "hold":
@@ -1928,7 +1942,13 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
                 bot_to_use = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
                 close_after = True
         uid = int(getattr(item, 'user_id', item['user_id']))
-        await bot_to_use.send_message(uid, text)
+        try:
+            await bot_to_use.send_message(uid, text)
+        except Exception:
+            logging.exception('send_item_user_message html send failed; retrying plain text')
+            plain = re.sub(r'</?tg-emoji[^>]*>', '', text)
+            plain = re.sub(r'<[^>]+>', '', plain)
+            await bot_to_use.send_message(uid, plain)
     finally:
         if close_after and bot_to_use is not None:
             await bot_to_use.session.close()
@@ -3447,7 +3467,8 @@ async def esim_choose_mode(callback: CallbackQuery):
         return
     mode = callback.data.split(':', 1)[1]
     text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:\n<i>Цена указана прямо в кнопках.</i>"
-    await safe_edit_or_send(callback, text, reply_markup=operators_kb(mode, 'esim_take', 'esim:back_mode', callback.from_user.id))
+    thread_id = getattr(callback.message, 'message_thread_id', None)
+    await safe_edit_or_send(callback, text, reply_markup=operators_group_kb(callback.message.chat.id, thread_id, mode, 'esim_take', 'esim:back_mode'))
     await callback.answer()
 
 
