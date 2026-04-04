@@ -26,9 +26,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 # CONFIG - ALL IN ONE FILE
 # =========================================================
-BOT_TOKEN = "8697722966:AAHdihJVgQPmoB3l9bpNyUHQQCIhuBwt8K8"
+BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
 DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "Asdfghjkllakbot"
+BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
