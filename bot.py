@@ -1938,6 +1938,7 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
 
     uid = int(uid_raw)
     submit_token = queue_item_submit_token(item)
+    preferred_token = (getattr(preferred_bot, 'token', None) or '').strip() if preferred_bot is not None else ''
     plain = re.sub(r'</?tg-emoji[^>]*>', '', text)
     plain = re.sub(r'<[^>]+>', '', plain)
 
@@ -1947,13 +1948,11 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
     def add_candidate(bot_obj: Bot | None, label: str, close_after: bool = False, token_hint: str | None = None):
         if bot_obj is None:
             return
-        token_value = token_hint or getattr(bot_obj, 'token', None)
+        token_value = (token_hint or getattr(bot_obj, 'token', None) or '').strip()
         if not token_value or token_value in seen_tokens:
             return
         seen_tokens.add(token_value)
         candidates.append((bot_obj, close_after, label))
-
-    add_candidate(preferred_bot, 'preferred_bot')
 
     live = LIVE_MIRROR_TASKS.get(submit_token)
     add_candidate(live.get('bot') if live else None, 'live_submit_bot', token_hint=submit_token)
@@ -1961,10 +1960,13 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
     if submit_token not in seen_tokens:
         add_candidate(Bot(token=submit_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)), 'submit_bot_new', close_after=True, token_hint=submit_token)
 
-    if BOT_TOKEN not in seen_tokens:
-        if preferred_bot is not None and getattr(preferred_bot, 'token', None) == BOT_TOKEN:
+    if preferred_token and preferred_token == submit_token:
+        add_candidate(preferred_bot, 'preferred_same_as_submit', token_hint=preferred_token)
+
+    if submit_token == BOT_TOKEN:
+        if preferred_bot is not None and preferred_token == BOT_TOKEN:
             add_candidate(preferred_bot, 'primary_preferred', token_hint=BOT_TOKEN)
-        else:
+        elif BOT_TOKEN not in seen_tokens:
             add_candidate(Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)), 'primary_bot_new', close_after=True, token_hint=BOT_TOKEN)
 
     last_exc = None
