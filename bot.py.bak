@@ -101,8 +101,6 @@ class AdminStates(StatesGroup):
     waiting_treasury_sub = State()
     waiting_treasury_invoice = State()
     waiting_operator_price = State()
-    waiting_group_finance_amount = State()
-    waiting_group_price_value = State()
     waiting_role_user = State()
     waiting_role_kind = State()
     waiting_start_text = State()
@@ -298,30 +296,6 @@ class Database:
                 created_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 paid_at TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS group_finance (
-                chat_id INTEGER NOT NULL,
-                thread_id INTEGER,
-                treasury_balance REAL NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (chat_id, thread_id)
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS group_operator_prices (
-                chat_id INTEGER NOT NULL,
-                thread_id INTEGER,
-                operator_key TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                price REAL NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (chat_id, thread_id, operator_key, mode)
             )
             """
         )
@@ -683,73 +657,6 @@ class Database:
     def subtract_treasury(self, amount: float):
         self.set_setting("treasury_balance", str(self.get_treasury() - amount))
 
-    def _thread_key(self, thread_id: Optional[int]):
-        return -1 if thread_id is None else int(thread_id)
-
-    def get_group_balance(self, chat_id: int, thread_id: Optional[int]) -> float:
-        row = self.conn.execute(
-            "SELECT treasury_balance FROM group_finance WHERE chat_id=? AND thread_id=?",
-            (int(chat_id), self._thread_key(thread_id)),
-        ).fetchone()
-        return float(row["treasury_balance"]) if row else 0.0
-
-    def set_group_balance(self, chat_id: int, thread_id: Optional[int], balance: float):
-        self.conn.execute(
-            "INSERT INTO group_finance (chat_id, thread_id, treasury_balance, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, thread_id) DO UPDATE SET treasury_balance=excluded.treasury_balance, updated_at=excluded.updated_at",
-            (int(chat_id), self._thread_key(thread_id), float(balance), now_str()),
-        )
-        self.conn.commit()
-
-    def add_group_balance(self, chat_id: int, thread_id: Optional[int], amount: float):
-        self.set_group_balance(chat_id, thread_id, self.get_group_balance(chat_id, thread_id) + float(amount))
-
-    def subtract_group_balance(self, chat_id: int, thread_id: Optional[int], amount: float):
-        self.set_group_balance(chat_id, thread_id, self.get_group_balance(chat_id, thread_id) - float(amount))
-
-    def get_group_price(self, chat_id: int, thread_id: Optional[int], operator_key: str, mode: str):
-        row = self.conn.execute(
-            "SELECT price FROM group_operator_prices WHERE chat_id=? AND thread_id=? AND operator_key=? AND mode=?",
-            (int(chat_id), self._thread_key(thread_id), operator_key, mode),
-        ).fetchone()
-        return float(row["price"]) if row else None
-
-    def set_group_price(self, chat_id: int, thread_id: Optional[int], operator_key: str, mode: str, price: float):
-        self.conn.execute(
-            "INSERT INTO group_operator_prices (chat_id, thread_id, operator_key, mode, price, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, thread_id, operator_key, mode) DO UPDATE SET price=excluded.price, updated_at=excluded.updated_at",
-            (int(chat_id), self._thread_key(thread_id), operator_key, mode, float(price), now_str()),
-        )
-        self.conn.commit()
-
-    def reserve_queue_item_for_group(self, item_id: int, taker_id: int, chat_id: int, thread_id: Optional[int], amount: float) -> bool:
-        current_balance = self.get_group_balance(chat_id, thread_id)
-        if current_balance + 1e-9 < float(amount):
-            return False
-        cur = self.conn.cursor()
-        cur.execute(
-            "UPDATE queue_items SET status='taken', taken_by_admin=?, taken_at=?, charge_chat_id=?, charge_thread_id=?, charge_amount=? WHERE id=? AND status='queued'",
-            (taker_id, now_str(), int(chat_id), self._thread_key(thread_id), float(amount), item_id),
-        )
-        if cur.rowcount <= 0:
-            self.conn.rollback()
-            return False
-        self.conn.execute(
-            "INSERT INTO group_finance (chat_id, thread_id, treasury_balance, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, thread_id) DO UPDATE SET treasury_balance=excluded.treasury_balance, updated_at=excluded.updated_at",
-            (int(chat_id), self._thread_key(thread_id), current_balance - float(amount), now_str()),
-        )
-        self.conn.commit()
-        return True
-
-    def release_item_reservation(self, item_id: int) -> float:
-        row = self.conn.execute("SELECT charge_chat_id, charge_thread_id, charge_amount FROM queue_items WHERE id=?", (item_id,)).fetchone()
-        if not row or row["charge_chat_id"] is None or row["charge_amount"] is None:
-            return 0.0
-        amount = float(row["charge_amount"] or 0)
-        thread_id = None if int(row["charge_thread_id"]) == -1 else int(row["charge_thread_id"])
-        self.add_group_balance(int(row["charge_chat_id"]), thread_id, amount)
-        self.conn.execute("UPDATE queue_items SET charge_chat_id=NULL, charge_thread_id=NULL, charge_amount=NULL WHERE id=?", (item_id,))
-        self.conn.commit()
-        return amount
-
     def enable_workspace(self, chat_id: int, thread_id: Optional[int], mode: str, added_by: int):
         self.conn.execute(
             "INSERT INTO workspaces (chat_id, thread_id, mode, added_by, created_at, is_enabled) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(chat_id, thread_id, mode) DO UPDATE SET is_enabled=1, added_by=excluded.added_by, created_at=excluded.created_at",
@@ -826,13 +733,11 @@ class Database:
                 SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
                 SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
-                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=?
+            WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?)
             """,
-            (int(chat_id), self._thread_key(thread_id)),
+            (chat_id, thread_id, thread_id),
         ).fetchone()
 
 
@@ -1069,7 +974,6 @@ def admin_root_kb():
     kb.button(text="📊 Сводка", callback_data="admin:summary")
     kb.button(text="📈 Стата групп", callback_data="admin:group_stats_panel")
     kb.button(text="💸 Выводы", callback_data="admin:withdraws")
-    kb.button(text="🏦 Казна групп", callback_data="admin:group_finance_panel")
     kb.button(text="⏳ Холд", callback_data="admin:hold")
     kb.button(text="💎 Прайсы", callback_data="admin:prices")
     kb.button(text="👥 Роли", callback_data="admin:roles")
@@ -1120,37 +1024,6 @@ def group_stats_list_kb():
     kb.adjust(1)
     return kb.as_markup()
 
-def group_finance_list_kb():
-    kb = InlineKeyboardBuilder()
-    seen = set()
-    for row in db.list_workspaces():
-        chat_id = int(row['chat_id'])
-        raw_thread = row['thread_id']
-        thread_id = None if raw_thread in (None, -1) else int(raw_thread)
-        key = (chat_id, thread_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        label = f"💬 {chat_id}" + (f" / topic {thread_id}" if thread_id else "")
-        kb.button(text=label[:60], callback_data=f"admin:groupfin:{chat_id}:{thread_id or 0}")
-    if not seen:
-        kb.button(text="• Пока нет рабочих групп", callback_data="admin:home")
-    kb.button(text="↩️ Назад", callback_data="admin:home")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def group_finance_manage_kb(chat_id: int, thread_id: int | None):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Пополнить", callback_data=f"admin:groupfin_add:{chat_id}:{thread_id or 0}")
-    kb.button(text="➖ Списать", callback_data=f"admin:groupfin_sub:{chat_id}:{thread_id or 0}")
-    for mode in ('hold', 'no_hold'):
-        for key in OPERATORS:
-            icon = '⏳' if mode == 'hold' else '⚡'
-            kb.button(text=f"{icon} {op_text(key)}", callback_data=f"admin:groupprice:{chat_id}:{thread_id or 0}:{mode}:{key}")
-    kb.button(text="↩️ К списку групп", callback_data="admin:group_finance_panel")
-    kb.adjust(2,2,2,2,2,2,1)
-    return kb.as_markup()
-
 def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
     totals = db.group_stats(chat_id, thread_id)
 
@@ -1161,15 +1034,13 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
             COUNT(*) AS total,
             SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
             SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
         FROM queue_items
-        WHERE charge_chat_id=? AND charge_thread_id=?
+        WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?)
         GROUP BY operator_key
         ORDER BY total DESC, operator_key ASC
         """,
-        (int(chat_id), db._thread_key(thread_id)),
+        (chat_id, thread_id, thread_id),
     ).fetchall()
 
     per_taker = db.conn.execute(
@@ -1192,7 +1063,7 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         op_lines.append(
             f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
             f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
-            f"💰 юзеру <b>{usd(row['paid_total'] or 0)}</b> • 🏦 <b>{usd(row['spent_total'] or 0)}</b> • 📈 <b>{usd(row['margin_total'] or 0)}</b>"
+            f"💰 <b>{usd(row['paid_total'] or 0)}</b>"
         )
     if not op_lines:
         op_lines = ["• Пока пусто"]
@@ -1219,9 +1090,7 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>\n"
         f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>\n"
         f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>\n"
-        f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>\n"
-        f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>\n"
-        f"📈 Маржа группы: <b>{usd(totals['margin_total'] or 0)}</b>\n\n"
+        f"💰 Тотал оплат: <b>{usd(totals['paid_total'] or 0)}</b>\n\n"
         "<b>📱 По операторам</b>\n" + "\n".join(op_lines) + "\n\n"
         "<b>👥 Кто сколько взял</b>\n" + "\n".join(taker_lines)
     )
@@ -1537,7 +1406,7 @@ def render_group_stats_panel() -> str:
         op_lines.append(
             f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
             f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
-            f"💰 юзеру <b>{usd(row['paid_total'] or 0)}</b> • 🏦 <b>{usd(row['spent_total'] or 0)}</b> • 📈 <b>{usd(row['margin_total'] or 0)}</b>"
+            f"💰 <b>{usd(row['paid_total'] or 0)}</b>"
         )
     if not op_lines:
         op_lines = ["• Пока пусто"]
@@ -1799,15 +1668,6 @@ def ensure_extra_schema():
     if 'last_seen_at' not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
     wd_cols = {r['name'] for r in cur.execute("PRAGMA table_info(withdrawals)").fetchall()}
-    qi_cols = {r['name'] for r in cur.execute("PRAGMA table_info(queue_items)").fetchall()}
-    if 'submit_bot_token' not in qi_cols:
-        cur.execute("ALTER TABLE queue_items ADD COLUMN submit_bot_token TEXT")
-    if 'charge_chat_id' not in qi_cols:
-        cur.execute("ALTER TABLE queue_items ADD COLUMN charge_chat_id INTEGER")
-    if 'charge_thread_id' not in qi_cols:
-        cur.execute("ALTER TABLE queue_items ADD COLUMN charge_thread_id INTEGER")
-    if 'charge_amount' not in qi_cols:
-        cur.execute("ALTER TABLE queue_items ADD COLUMN charge_amount REAL")
     if 'payout_check_id' not in wd_cols:
         cur.execute("ALTER TABLE withdrawals ADD COLUMN payout_check_id INTEGER")
     defaults = {
@@ -1830,18 +1690,18 @@ def ensure_extra_schema():
 ensure_extra_schema()
 
 
-def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
+def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str):
     cur = db.conn.cursor()
     cur.execute(
         """
         INSERT INTO queue_items (
             user_id, username, full_name, operator_key, phone_label, normalized_phone,
-            qr_file_id, status, price, created_at, mode, submit_bot_token
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            qr_file_id, status, price, created_at, mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
         """,
         (
             user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode
         ),
     )
     db.conn.commit()
@@ -1894,58 +1754,6 @@ def set_user_blocked(user_id: int, flag: bool):
     db.conn.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if flag else 0, user_id))
     db.conn.commit()
 
-
-def queue_item_submit_token(item) -> str:
-    token = getattr(item, "submit_bot_token", None)
-    if token is None and hasattr(item, 'keys'):
-        token = item["submit_bot_token"] if "submit_bot_token" in item.keys() else None
-    return (token or BOT_TOKEN).strip() or BOT_TOKEN
-
-async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
-    token = queue_item_submit_token(item)
-    bot_to_use = None
-    close_after = False
-    try:
-        if preferred_bot is not None and getattr(preferred_bot, 'token', None) == token:
-            bot_to_use = preferred_bot
-        else:
-            live = LIVE_MIRROR_TASKS.get(token)
-            bot_to_use = live.get('bot') if live else None
-            if bot_to_use is None:
-                bot_to_use = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-                close_after = True
-        uid = int(getattr(item, 'user_id', item['user_id']))
-        await bot_to_use.send_message(uid, text)
-    finally:
-        if close_after and bot_to_use is not None:
-            await bot_to_use.session.close()
-
-def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
-    price = db.get_group_price(chat_id, thread_id, operator_key, mode)
-    if price is not None:
-        return float(price)
-    return float(get_mode_price(operator_key, mode, None))
-
-def render_group_finance(chat_id: int, thread_id: int | None) -> str:
-    where_label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
-    balance = db.get_group_balance(chat_id, thread_id)
-    reserved_row = db.conn.execute(
-        "SELECT SUM(charge_amount) AS s FROM queue_items WHERE charge_chat_id=? AND charge_thread_id=? AND status IN ('taken','in_progress')",
-        (int(chat_id), db._thread_key(thread_id)),
-    ).fetchone()
-    reserved = float(reserved_row['s'] or 0)
-    lines = [
-        "<b>🏦 Казна группы</b>",
-        "",
-        f"💬 Группа: {where_label}",
-        f"💰 Доступно: <b>{usd(balance)}</b>",
-        f"🔒 В резерве: <b>{usd(reserved)}</b>",
-        "",
-        "<b>Прайсы группы для операторов</b>",
-    ]
-    for key in OPERATORS:
-        lines.append(f"• {op_text(key)} — ⏳ {usd(group_price_for_take(chat_id, thread_id, key, 'hold'))} / ⚡ {usd(group_price_for_take(chat_id, thread_id, key, 'no_hold'))}")
-    return "\n".join(lines)
 
 def touch_user(user_id: int, username: str, full_name: str):
     db.upsert_user(user_id, username or '', full_name or '')
@@ -2541,7 +2349,6 @@ async def submit_qr(message: Message, state: FSMContext):
         phone,
         file_id,
         mode,
-        getattr(message.bot, "token", BOT_TOKEN),
     )
     await state.clear()
     await message.answer(
@@ -3287,21 +3094,9 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
     if not item:
         await message.answer(f"📭 Для оператора {op_text(operator_key)} очередь пуста.")
         return
-    group_price = group_price_for_take(message.chat.id, thread_id, item.operator_key, item.mode)
-    if db.get_group_balance(message.chat.id, thread_id) + 1e-9 < group_price:
-        await message.answer(f"Недостаточно средств в казне группы. Нужно {usd(group_price)}")
-        return
-    if not db.reserve_queue_item_for_group(item.id, message.from_user.id, message.chat.id, thread_id, group_price):
-        await message.answer("Заявку уже забрали.")
-        return
+    db.mark_taken(item.id, message.from_user.id)
     item = db.get_queue_item(item.id)
-    try:
-        await message.answer_photo(item.qr_file_id, caption=queue_caption(item), reply_markup=admin_queue_kb(item))
-    except Exception:
-        db.release_item_reservation(item.id)
-        db.conn.execute("UPDATE queue_items SET status='queued', taken_by_admin=NULL, taken_at=NULL WHERE id=?", (item.id,))
-        db.conn.commit()
-        raise
+    await message.answer_photo(item.qr_file_id, caption=queue_caption(item), reply_markup=admin_queue_kb(item))
 
 
 @router.message(Command("mts", "mtc", "bil", "mega", "t2"))
@@ -3427,26 +3222,13 @@ async def esim_take(callback: CallbackQuery):
     if callback.message.chat.type == ChatType.PRIVATE:
         await callback.answer('Команда доступна только в группе', show_alert=True)
         return
-    group_price = group_price_for_take(callback.message.chat.id, thread_id, item.operator_key, item.mode)
-    if db.get_group_balance(callback.message.chat.id, thread_id) + 1e-9 < group_price:
-        await callback.answer(f"Недостаточно средств в казне группы. Нужно {usd(group_price)}", show_alert=True)
-        return
-    if not db.reserve_queue_item_for_group(item.id, callback.from_user.id, callback.message.chat.id, thread_id, group_price):
-        await callback.answer("Заявку уже забрали", show_alert=True)
-        return
+    db.mark_taken(item.id, callback.from_user.id)
     fresh = db.get_queue_item(item.id)
     photo = fresh.qr_file_id
+    await callback.message.answer_photo(photo, caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
     try:
-        await callback.message.answer_photo(photo, caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
-    except Exception:
-        db.release_item_reservation(item.id)
-        db.conn.execute("UPDATE queue_items SET status='queued', taken_by_admin=NULL, taken_at=NULL WHERE id=?", (item.id,))
-        db.conn.commit()
-        raise
-    try:
-        await send_item_user_message(
-            callback.bot,
-            fresh,
+        await callback.bot.send_message(
+            fresh.user_id,
             f"<b>📥 Номер взят в обработку</b>\n\n🧾 <b>Заявка:</b> #{fresh.id}\n📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 <b>Режим:</b> {mode_label(fresh.mode)}"
         )
     except Exception:
@@ -3532,9 +3314,8 @@ async def hold_watcher(bot: Bot):
                     fresh_user = db.get_user(item.user_id)
                     balance = float(fresh_user["balance"] if fresh_user else 0.0)
                     try:
-                        await send_item_user_message(
-                            bot,
-                            item,
+                        await bot.send_message(
+                            item.user_id,
                             "<b>✅ Оплата за номер</b>\n\n"
                             f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
                             f"💰 <b>Начислено:</b> {usd(item.price)}\n"
@@ -3880,9 +3661,8 @@ async def take_start_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            fresh,
+        await callback.bot.send_message(
+            fresh.user_id,
             "<b>✅ Номер — Встал ✅</b>\n\n"
             "🚀 <b>По вашему номеру началась работа</b>\n\n"
             f"📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n"
@@ -3904,7 +3684,6 @@ async def error_pre_cb(callback: CallbackQuery):
         await callback.answer("Заявка не найдена", show_alert=True)
         return
     db.mark_error_before_start(item_id)
-    db.release_item_reservation(item_id)
     fresh = db.get_queue_item(item_id) or item
     try:
         if getattr(callback.message, "photo", None):
@@ -3914,9 +3693,8 @@ async def error_pre_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            item,
+        await callback.bot.send_message(
+            item.user_id,
             "<b>⚠️ Ошибка — номер не встал</b>\n\n"
             f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
             "❌ <b>Номер не принят в работу.</b>"
@@ -3948,9 +3726,8 @@ async def instant_pay_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            item,
+        await callback.bot.send_message(
+            item.user_id,
             "<b>✅ Оплата за номер</b>\n\n"
             f"📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
             f"💰 <b>Начислено:</b> {usd(item.price)}\n"
@@ -3977,7 +3754,6 @@ async def slip_cb(callback: CallbackQuery):
         worked = f"{secs//60:02d}:{secs%60:02d}"
     db.conn.execute("UPDATE queue_items SET status='failed', fail_reason='slip', completed_at=? WHERE id=?", (now_str(), item_id))
     db.conn.commit()
-    db.release_item_reservation(item_id)
     fresh = db.get_queue_item(item_id) or item
     remain = time_left_text(item.hold_until) if item.mode == "hold" else "—"
     slip_text = queue_caption(fresh) + f"\n\n❌ <b>Номер слетел</b>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
@@ -3989,9 +3765,8 @@ async def slip_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            item,
+        await callback.bot.send_message(
+            item.user_id,
             f"<b>❌ Номер слетел</b>\n\n📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
         )
     except Exception:
@@ -4280,15 +4055,13 @@ async def group_stata(message: Message):
                 COUNT(*) AS total,
                 SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
                 SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
-                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=?
+            WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?)
             GROUP BY operator_key
             ORDER BY total DESC, operator_key ASC
             """,
-            (int(chat_id), db._thread_key(thread_id)),
+            (chat_id, thread_id, thread_id),
         ).fetchall()
 
         lines = [f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>",
@@ -4296,9 +4069,7 @@ async def group_stata(message: Message):
                  f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>",
                  f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>",
                  f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>",
-                 f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>",
-                 f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>",
-                 f"📈 Маржа группы: <b>{usd(totals['margin_total'] or 0)}</b>"]
+                 f"💰 Тотал оплат: <b>{usd(totals['paid_total'] or 0)}</b>"]
         if per_operator:
             lines.append("")
             lines.append("<b>📱 По операторам</b>")
@@ -4340,104 +4111,6 @@ async def admin_channel_value(message: Message, state: FSMContext):
 
 
 
-
-@router.message(Command("kazna"))
-async def kazna_command(message: Message):
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer("Команда работает только в рабочей группе или топике.")
-        return
-    thread_id = getattr(message, "message_thread_id", None)
-    await message.answer(render_group_finance(message.chat.id, thread_id))
-
-@router.callback_query(F.data == "admin:group_finance_panel")
-async def admin_group_finance_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await safe_edit_or_send(callback, "<b>🏦 Выберите группу / топик для казны:</b>", reply_markup=group_finance_list_kb())
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("admin:groupfin:"))
-async def admin_group_finance_open(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    _, _, chat_id, thread_id = callback.data.split(":")
-    chat_id = int(chat_id)
-    thread_id = None if int(thread_id) == 0 else int(thread_id)
-    await safe_edit_or_send(callback, render_group_finance(chat_id, thread_id), reply_markup=group_finance_manage_kb(chat_id, thread_id))
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("admin:groupfin_add:"))
-@router.callback_query(F.data.startswith("admin:groupfin_sub:"))
-async def admin_group_finance_change_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    parts = callback.data.split(":")
-    action = "add" if parts[1].endswith("add") else "sub"
-    chat_id = int(parts[2])
-    thread_id = None if int(parts[3]) == 0 else int(parts[3])
-    await state.set_state(AdminStates.waiting_group_finance_amount)
-    await state.update_data(group_fin_action=action, group_fin_chat_id=chat_id, group_fin_thread_id=thread_id)
-    label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
-    await callback.message.answer(f"Введите сумму для действия <b>{'пополнить' if action == 'add' else 'списать'}</b> в группе {label}:")
-    await callback.answer()
-
-@router.message(AdminStates.waiting_group_finance_amount)
-async def admin_group_finance_amount(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        value = float((message.text or '').replace(',', '.').replace('$', '').strip())
-    except Exception:
-        await message.answer("Введите сумму числом.")
-        return
-    if value <= 0:
-        await message.answer("Сумма должна быть больше 0.")
-        return
-    data = await state.get_data()
-    chat_id = int(data['group_fin_chat_id'])
-    thread_id = data.get('group_fin_thread_id')
-    if data.get('group_fin_action') == 'add':
-        db.add_group_balance(chat_id, thread_id, value)
-    else:
-        if value > db.get_group_balance(chat_id, thread_id):
-            await message.answer("Недостаточно средств в казне группы.")
-            return
-        db.subtract_group_balance(chat_id, thread_id, value)
-    await state.clear()
-    await message.answer(render_group_finance(chat_id, thread_id), reply_markup=group_finance_manage_kb(chat_id, thread_id))
-
-@router.callback_query(F.data.startswith("admin:groupprice:"))
-async def admin_group_price_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    _, _, chat_id, thread_id, mode, operator_key = callback.data.split(":")
-    thread_id = None if int(thread_id) == 0 else int(thread_id)
-    await state.set_state(AdminStates.waiting_group_price_value)
-    await state.update_data(group_price_chat_id=int(chat_id), group_price_thread_id=thread_id, price_mode=mode, operator_key=operator_key)
-    label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
-    await callback.message.answer(f"Введите цену для группы {label}: {op_text(operator_key)} • <b>{mode_label(mode)}</b>")
-    await callback.answer()
-
-@router.message(AdminStates.waiting_group_price_value)
-async def admin_group_price_value(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        value = float((message.text or '').replace(',', '.').replace('$', '').strip())
-    except Exception:
-        await message.answer("Введите цену числом.")
-        return
-    if value <= 0:
-        await message.answer("Цена должна быть больше 0.")
-        return
-    data = await state.get_data()
-    chat_id = int(data['group_price_chat_id'])
-    thread_id = data.get('group_price_thread_id')
-    db.set_group_price(chat_id, thread_id, data['operator_key'], data['price_mode'], value)
-    await state.clear()
-    await message.answer(render_group_finance(chat_id, thread_id), reply_markup=group_finance_manage_kb(chat_id, thread_id))
 
 @router.message()
 async def track_any_message(message: Message):
