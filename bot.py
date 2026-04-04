@@ -149,6 +149,17 @@ class QueueItem:
     completed_at: Optional[str]
     timer_last_render: Optional[str]
     submit_bot_token: Optional[str] = None
+    charge_chat_id: Optional[int] = None
+    charge_thread_id: Optional[int] = None
+    charge_amount: Optional[float] = None
+
+    @classmethod
+    def from_row(cls, row):
+        if row is None:
+            return None
+        data = dict(row)
+        allowed = cls.__annotations__.keys()
+        return cls(**{k: data.get(k) for k in allowed})
 
 
 class Database:
@@ -514,14 +525,14 @@ class Database:
 
     def get_queue_item(self, item_id: int):
         row = self.conn.execute("SELECT * FROM queue_items WHERE id = ?", (item_id,)).fetchone()
-        return QueueItem(**row) if row else None
+        return QueueItem.from_row(row)
 
     def get_next_queue_item(self, operator_key: str):
         row = self.conn.execute(
             "SELECT * FROM queue_items WHERE operator_key = ? AND status = 'queued' ORDER BY id ASC LIMIT 1",
             (operator_key,),
         ).fetchone()
-        return QueueItem(**row) if row else None
+        return QueueItem.from_row(row)
 
     def count_waiting(self, operator_key: str) -> int:
         row = self.conn.execute(
@@ -580,13 +591,13 @@ class Database:
             "SELECT * FROM queue_items WHERE status='in_progress' AND mode='hold' AND hold_until IS NOT NULL AND hold_until <= ?",
             (now_str(),),
         ).fetchall()
-        return [QueueItem(**row) for row in rows]
+        return [QueueItem.from_row(row) for row in rows]
 
     def get_active_holds_for_render(self):
         rows = self.conn.execute(
             "SELECT * FROM queue_items WHERE status='in_progress' AND mode='hold' AND hold_until IS NOT NULL AND work_chat_id IS NOT NULL AND work_message_id IS NOT NULL"
         ).fetchall()
-        return [QueueItem(**row) for row in rows]
+        return [QueueItem.from_row(row) for row in rows]
 
     def touch_timer_render(self, item_id: int):
         self.conn.execute("UPDATE queue_items SET timer_last_render=? WHERE id=?", (now_str(), item_id))
@@ -1866,7 +1877,7 @@ def count_waiting_mode(operator_key: str, mode: str) -> int:
 
 def get_next_queue_item_mode(operator_key: str, mode: str):
     row = db.conn.execute("SELECT * FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' ORDER BY id ASC LIMIT 1", (operator_key, mode)).fetchone()
-    return QueueItem(**row) if row else None
+    return QueueItem.from_row(row)
 
 
 def latest_queue_items(limit: int = 10):
