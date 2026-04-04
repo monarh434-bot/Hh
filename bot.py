@@ -148,6 +148,7 @@ class QueueItem:
     fail_reason: Optional[str]
     completed_at: Optional[str]
     timer_last_render: Optional[str]
+    submit_bot_token: Optional[str] = None
 
 
 class Database:
