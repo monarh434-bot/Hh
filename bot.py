@@ -28,11 +28,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
 DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "esimservicexbot"
+BOT_USERNAME_FALLBACK = "Seamusstest_bot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = []
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
@@ -4416,6 +4416,47 @@ async def group_stata(message: Message):
         await message.answer("<b>📊 Статистика этой группы / топика</b>\n\n" + "\n".join(lines))
     except Exception:
         await message.answer("⚠️ Не удалось собрать статистику группы. Смотрите её через кнопку в /admin.")
+
+
+@router.callback_query(F.data == "admin:set_withdraw_channel")
+async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    await state.update_data(channel_target="withdraw_channel_id")
+    await state.set_state(AdminStates.waiting_channel_value)
+    current_value = escape(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID)))
+    await callback.message.answer(
+        "Введите новый <b>ID канала выплат</b>:\n"
+        f"Текущее значение: <code>{current_value}</code>"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:set_backup_channel")
+async def admin_set_backup_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    await state.update_data(channel_target="backup_channel_id")
+    await state.set_state(AdminStates.waiting_channel_value)
+    current_value = escape(db.get_setting("backup_channel_id", "0"))
+    await callback.message.answer(
+        "Введите новый <b>ID канала автобэкапа</b>:\n"
+        f"Текущее значение: <code>{current_value}</code>"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:toggle_backup")
+async def admin_toggle_backup(callback: CallbackQuery):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    enabled = not is_backup_enabled()
+    set_backup_enabled(enabled)
+    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
+    await callback.answer("Автовыгрузка включена" if enabled else "Автовыгрузка выключена")
 
 
 @router.callback_query(F.data == "admin:set_log_channel")
