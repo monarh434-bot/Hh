@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import logging
 import re
 import sqlite3
@@ -1920,6 +1921,35 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
         if close_after and bot_to_use is not None:
             await bot_to_use.session.close()
 
+
+async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, caption: str, reply_markup=None, message_thread_id: int | None = None):
+    token = queue_item_submit_token(item)
+    source_bot = None
+    close_after = False
+    photo = getattr(item, 'qr_file_id', None)
+    if photo is None and hasattr(item, 'keys'):
+        photo = item['qr_file_id']
+    try:
+        if token == getattr(target_bot, 'token', None):
+            try:
+                return await target_bot.send_photo(chat_id, photo, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+            except Exception:
+                logging.exception('send_photo by file_id failed, trying download+reupload')
+        live = LIVE_MIRROR_TASKS.get(token)
+        source_bot = live.get('bot') if live else None
+        if source_bot is None:
+            source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            close_after = True
+        telegram_file = await source_bot.get_file(photo)
+        file_bytes = io.BytesIO()
+        await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
+        file_bytes.seek(0)
+        upload = BufferedInputFile(file_bytes.read(), filename=f"queue_{getattr(item, 'id', 'item')}.jpg")
+        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+    finally:
+        if close_after and source_bot is not None:
+            await source_bot.session.close()
+
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
     price = db.get_group_price(chat_id, thread_id, operator_key, mode)
     if price is not None:
@@ -3296,7 +3326,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         return
     item = db.get_queue_item(item.id)
     try:
-        await message.answer_photo(item.qr_file_id, caption=queue_caption(item), reply_markup=admin_queue_kb(item))
+        await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, queue_caption(item), reply_markup=admin_queue_kb(item), message_thread_id=thread_id)
     except Exception:
         db.release_item_reservation(item.id)
         db.conn.execute("UPDATE queue_items SET status='queued', taken_by_admin=NULL, taken_at=NULL WHERE id=?", (item.id,))
@@ -3435,9 +3465,8 @@ async def esim_take(callback: CallbackQuery):
         await callback.answer("Заявку уже забрали", show_alert=True)
         return
     fresh = db.get_queue_item(item.id)
-    photo = fresh.qr_file_id
     try:
-        await callback.message.answer_photo(photo, caption=queue_caption(fresh), reply_markup=admin_queue_kb(fresh))
+        await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, fresh, queue_caption(fresh), reply_markup=admin_queue_kb(fresh), message_thread_id=thread_id)
     except Exception:
         db.release_item_reservation(item.id)
         db.conn.execute("UPDATE queue_items SET status='queued', taken_by_admin=NULL, taken_at=NULL WHERE id=?", (item.id,))
