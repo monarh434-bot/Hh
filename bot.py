@@ -26,13 +26,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 # CONFIG - ALL IN ONE FILE
 # =========================================================
-BOT_TOKEN = "8731355621:AAGBnukT61jO9OOjZFepx_Tqgk1-w3n1gg4"
+BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
 DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "Seamusstest_bot"
+BOT_USERNAME_FALLBACK = "@esimservicexbot"
 
 # Roles
-CHIEF_ADMIN_ID = 626387429
-BOOTSTRAP_ADMINS = [123456789]
+CHIEF_ADMIN_ID = 7133092873
+BOOTSTRAP_ADMINS = []
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
