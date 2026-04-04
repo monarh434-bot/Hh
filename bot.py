@@ -1929,29 +1929,63 @@ def queue_item_submit_token(item) -> str:
     return (token or BOT_TOKEN).strip() or BOT_TOKEN
 
 async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
-    token = queue_item_submit_token(item)
-    bot_to_use = None
-    close_after = False
-    try:
-        if preferred_bot is not None and getattr(preferred_bot, 'token', None) == token:
-            bot_to_use = preferred_bot
+    uid = int(getattr(item, 'user_id', item['user_id']))
+    submit_token = queue_item_submit_token(item)
+    plain = re.sub(r'</?tg-emoji[^>]*>', '', text)
+    plain = re.sub(r'<[^>]+>', '', plain)
+
+    candidates: list[tuple[Bot, bool, str]] = []
+    seen_tokens: set[str] = set()
+
+    def add_candidate(bot_obj: Bot | None, label: str, close_after: bool = False, token_hint: str | None = None):
+        if bot_obj is None:
+            return
+        token_value = token_hint or getattr(bot_obj, 'token', None)
+        if not token_value or token_value in seen_tokens:
+            return
+        seen_tokens.add(token_value)
+        candidates.append((bot_obj, close_after, label))
+
+    add_candidate(preferred_bot, 'preferred_bot')
+
+    live = LIVE_MIRROR_TASKS.get(submit_token)
+    add_candidate(live.get('bot') if live else None, 'live_submit_bot', token_hint=submit_token)
+
+    if submit_token not in seen_tokens:
+        add_candidate(Bot(token=submit_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)), 'submit_bot_new', close_after=True, token_hint=submit_token)
+
+    if BOT_TOKEN not in seen_tokens:
+        if preferred_bot is not None and getattr(preferred_bot, 'token', None) == BOT_TOKEN:
+            add_candidate(preferred_bot, 'primary_preferred', token_hint=BOT_TOKEN)
         else:
-            live = LIVE_MIRROR_TASKS.get(token)
-            bot_to_use = live.get('bot') if live else None
-            if bot_to_use is None:
-                bot_to_use = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-                close_after = True
-        uid = int(getattr(item, 'user_id', item['user_id']))
+            add_candidate(Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)), 'primary_bot_new', close_after=True, token_hint=BOT_TOKEN)
+
+    last_exc = None
+    for bot_obj, close_after, label in candidates:
         try:
-            await bot_to_use.send_message(uid, text)
-        except Exception:
-            logging.exception('send_item_user_message html send failed; retrying plain text')
-            plain = re.sub(r'</?tg-emoji[^>]*>', '', text)
-            plain = re.sub(r'<[^>]+>', '', plain)
-            await bot_to_use.send_message(uid, plain)
-    finally:
-        if close_after and bot_to_use is not None:
-            await bot_to_use.session.close()
+            try:
+                await bot_obj.send_message(uid, text)
+                logging.info('User notify sent via %s to user_id=%s item_id=%s', label, uid, getattr(item, 'id', '?'))
+                return True
+            except Exception as exc:
+                last_exc = exc
+                logging.exception('send_item_user_message html send failed via %s; retrying plain text', label)
+                await bot_obj.send_message(uid, plain)
+                logging.info('User notify sent in plain text via %s to user_id=%s item_id=%s', label, uid, getattr(item, 'id', '?'))
+                return True
+        except Exception as exc:
+            last_exc = exc
+            logging.exception('send_item_user_message failed via %s for user_id=%s item_id=%s', label, uid, getattr(item, 'id', '?'))
+        finally:
+            if close_after:
+                try:
+                    await bot_obj.session.close()
+                except Exception:
+                    pass
+
+    if last_exc is not None:
+        raise last_exc
+    return False
 
 
 async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, caption: str, reply_markup=None, message_thread_id: int | None = None):
