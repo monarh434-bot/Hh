@@ -28,11 +28,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
 DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "@esimservicexbot"
+BOT_USERNAME_FALLBACK = "Seamusstest_bot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = []
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
