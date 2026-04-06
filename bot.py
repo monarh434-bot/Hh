@@ -4473,9 +4473,7 @@ async def group_stata(message: Message):
         ]
         if role in {"chief_admin", "admin"}:
             lines.extend([
-                f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>",
                 f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>",
-                f"📈 Маржа группы: <b>{usd(totals['margin_total'] or 0)}</b>",
             ])
         if per_operator:
             lines.append("")
