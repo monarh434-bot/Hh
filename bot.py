@@ -858,6 +858,17 @@ def msk_now() -> datetime:
 def now_str() -> str:
     return msk_now().strftime("%Y-%m-%d %H:%M:%S")
 
+def msk_today_bounds_str() -> tuple[str, str, str]:
+    now = msk_now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    label = start.strftime("%d.%m.%Y")
+    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), label
+
+def msk_stats_reset_note() -> str:
+    return "Сброс каждый день в 00:00 МСК"
+
+
 
 def fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1177,7 +1188,26 @@ def group_finance_manage_kb(chat_id: int, thread_id: int | None):
     return kb.as_markup()
 
 def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
-    totals = db.group_stats(chat_id, thread_id)
+    day_start, day_end, day_label = msk_today_bounds_str()
+    thread_key = db._thread_key(thread_id)
+
+    totals = db.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN work_started_at IS NOT NULL THEN 1 ELSE 0 END) AS started,
+            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+        FROM queue_items
+        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+        """,
+        (int(chat_id), thread_key, day_start, day_end),
+    ).fetchone()
 
     per_operator = db.conn.execute(
         """
@@ -1186,15 +1216,13 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
             COUNT(*) AS total,
             SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
             SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+            SUM(COALESCE(charge_amount, price)) AS turnover_total
         FROM queue_items
-        WHERE charge_chat_id=? AND charge_thread_id=?
+        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
         GROUP BY operator_key
         ORDER BY total DESC, operator_key ASC
         """,
-        (int(chat_id), db._thread_key(thread_id)),
+        (int(chat_id), thread_key, day_start, day_end),
     ).fetchall()
 
     per_taker = db.conn.execute(
@@ -1202,14 +1230,14 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         SELECT
             taken_by_admin AS taker_user_id,
             COUNT(*) AS total,
-            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+            SUM(COALESCE(charge_amount, price)) AS turnover_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total
         FROM queue_items
-        WHERE work_chat_id=? AND ((work_thread_id IS NULL AND ? IS NULL) OR work_thread_id=?) AND taken_by_admin IS NOT NULL
+        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<? AND taken_by_admin IS NOT NULL
         GROUP BY taken_by_admin
         ORDER BY total DESC
         """,
-        (chat_id, thread_id, thread_id),
+        (int(chat_id), thread_key, day_start, day_end),
     ).fetchall()
 
     op_lines = []
@@ -1217,7 +1245,7 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         op_lines.append(
             f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
             f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
-            f"💰 юзеру <b>{usd(row['paid_total'] or 0)}</b> • 🏦 <b>{usd(row['spent_total'] or 0)}</b> • 📈 <b>{usd(row['margin_total'] or 0)}</b>"
+            f"🏦 <b>{usd(row['turnover_total'] or 0)}</b>"
         )
     if not op_lines:
         op_lines = ["• Пока пусто"]
@@ -1230,15 +1258,17 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         taker_lines.append(
             f"• <b>{name}</b> — взял: {int(row['total'] or 0)}, "
             f"успешно: {int(row['completed_total'] or 0)}, "
-            f"оплат: <b>{usd(row['paid_total'] or 0)}</b>"
+            f"на сумму: <b>{usd(row['turnover_total'] or 0)}</b>"
         )
     if not taker_lines:
         taker_lines = ["• Пока никто не брал номера"]
 
     where_label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
     return (
-        "<b>📈 Статистика группы</b>\n\n"
-        f"💬 Группа: {where_label}\n\n"
+        "<b>📈 Статистика группы за сегодня</b>\n\n"
+        f"💬 Группа: {where_label}\n"
+        f"🗓 День: <b>{day_label}</b>\n"
+        f"♻️ {msk_stats_reset_note()}\n\n"
         f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>\n"
         f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>\n"
         f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>\n"
@@ -1343,17 +1373,21 @@ def escape(value: Optional[str]) -> str:
 
 
 def queue_caption(item: QueueItem) -> str:
+    display_price = getattr(item, 'charge_amount', None)
+    if display_price in (None, 0, 0.0):
+        charge_chat_id = getattr(item, 'charge_chat_id', None)
+        if charge_chat_id:
+            display_price = group_price_for_take(charge_chat_id, getattr(item, 'charge_thread_id', None), item.operator_key, item.mode)
     text = (
         f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
         f"👤 От: <b>{escape(item.full_name)}</b>\n"
         f"🆔 ID: <code>{item.user_id}</code>\n"
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
-        f"💰 Цена для сдающего: <b>{usd(item.price)}</b>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
-    if getattr(item, 'charge_amount', None) not in (None, 0, 0.0):
-        text += f"\n🏷 Прайс группы: <b>{usd(float(item.charge_amount))}</b>"
+    if display_price not in (None, 0, 0.0):
+        text += f"\n🏷 Прайс группы: <b>{usd(float(display_price))}</b>"
     if item.status == "in_progress":
         text += "\n\n🚀 <b>Работа началась</b>"
         if item.mode == "hold":
@@ -1515,6 +1549,7 @@ def render_mirror_menu(user_id: int) -> str:
 
 
 def render_group_stats_panel() -> str:
+    day_start, day_end, day_label = msk_today_bounds_str()
     totals = db.conn.execute(
         """
         SELECT
@@ -1524,10 +1559,13 @@ def render_group_stats_panel() -> str:
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
             SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS turnover_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL
-        """
+        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<?
+        """,
+        (day_start, day_end),
     ).fetchone()
 
     per_operator = db.conn.execute(
@@ -1537,12 +1575,13 @@ def render_group_stats_panel() -> str:
             COUNT(*) AS total,
             SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
             SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+            SUM(COALESCE(charge_amount, price)) AS turnover_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL
+        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<?
         GROUP BY operator_key
         ORDER BY total DESC, operator_key ASC
-        """
+        """,
+        (day_start, day_end),
     ).fetchall()
 
     per_taker = db.conn.execute(
@@ -1550,13 +1589,14 @@ def render_group_stats_panel() -> str:
         SELECT
             taken_by_admin AS taker_user_id,
             COUNT(*) AS total,
-            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total
+            SUM(COALESCE(charge_amount, price)) AS turnover_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL AND taken_by_admin IS NOT NULL
+        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<? AND taken_by_admin IS NOT NULL
         GROUP BY taken_by_admin
         ORDER BY total DESC
-        """
+        """,
+        (day_start, day_end),
     ).fetchall()
 
     op_lines = []
@@ -1564,7 +1604,7 @@ def render_group_stats_panel() -> str:
         op_lines.append(
             f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
             f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
-            f"💰 юзеру <b>{usd(row['paid_total'] or 0)}</b> • 🏦 <b>{usd(row['spent_total'] or 0)}</b> • 📈 <b>{usd(row['margin_total'] or 0)}</b>"
+            f"🏦 <b>{usd(row['turnover_total'] or 0)}</b>"
         )
     if not op_lines:
         op_lines = ["• Пока пусто"]
@@ -1577,20 +1617,24 @@ def render_group_stats_panel() -> str:
         taker_lines.append(
             f"• <b>{name}</b> — взял: {int(row['total'] or 0)}, "
             f"успешно: {int(row['completed_total'] or 0)}, "
-            f"оплат: <b>{usd(row['paid_total'] or 0)}</b>"
+            f"на сумму: <b>{usd(row['turnover_total'] or 0)}</b>"
         )
     if not taker_lines:
         taker_lines = ["• Пока никто не брал номера"]
 
     return (
-        "<b>📈 Стата групп</b>\n\n"
+        "<b>📈 Стата групп за сегодня</b>\n\n"
+        f"🗓 День: <b>{day_label}</b>\n"
+        f"♻️ {msk_stats_reset_note()}\n\n"
         f"📦 Всего заявок в рабочих группах: <b>{int(totals['total'] or 0)}</b>\n"
         f"🙋 Взято: <b>{int(totals['taken_total'] or 0)}</b>\n"
         f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>\n"
         f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>\n"
         f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>\n"
         f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>\n"
-        f"💰 Тотал оплат: <b>{usd(totals['paid_total'] or 0)}</b>\n\n"
+        f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>\n"
+        f"🏦 Общий оборот: <b>{usd(totals['turnover_total'] or 0)}</b>\n"
+        f"📈 Общая маржа: <b>{usd(totals['margin_total'] or 0)}</b>\n\n"
         "<b>📱 По операторам</b>\n" + "\n".join(op_lines) + "\n\n"
         "<b>👥 Кто сколько взял</b>\n" + "\n".join(taker_lines)
     )
@@ -4368,15 +4412,36 @@ async def db_upload_wrong(message: Message):
 @router.message(Command("stata"))
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
-    if user_role(message.from_user.id) not in {"chief_admin", "admin", "operator"}:
+    role = user_role(message.from_user.id)
+    if role not in {"chief_admin", "admin", "operator"}:
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Статистику групп смотрите через кнопку в /admin.")
         return
     try:
+        day_start, day_end, day_label = msk_today_bounds_str()
         chat_id = message.chat.id
         thread_id = getattr(message, "message_thread_id", None)
-        totals = db.group_stats(chat_id, thread_id)
+        thread_key = db._thread_key(thread_id)
+
+        totals = db.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+                SUM(CASE WHEN work_started_at IS NOT NULL THEN 1 ELSE 0 END) AS started,
+                SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
+                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
+                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total,
+                SUM(COALESCE(charge_amount, price)) AS turnover_total
+            FROM queue_items
+            WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+            """,
+            (int(chat_id), thread_key, day_start, day_end),
+        ).fetchone()
 
         per_operator = db.conn.execute(
             """
@@ -4385,25 +4450,33 @@ async def group_stata(message: Message):
                 COUNT(*) AS total,
                 SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
                 SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
-                SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+                SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=?
+            WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
             GROUP BY operator_key
             ORDER BY total DESC, operator_key ASC
             """,
-            (int(chat_id), db._thread_key(thread_id)),
+            (int(chat_id), thread_key, day_start, day_end),
         ).fetchall()
 
-        lines = [f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>",
-                 f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>",
-                 f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>",
-                 f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>",
-                 f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>",
-                 f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>",
-                 f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>",
-                 f"📈 Маржа группы: <b>{usd(totals['margin_total'] or 0)}</b>"]
+        lines = [
+            f"<b>📊 Статистика этой группы / топика за сегодня</b>",
+            f"🗓 День: <b>{day_label}</b>",
+            f"♻️ {msk_stats_reset_note()}",
+            "",
+            f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>",
+            f"🚀 Начато: <b>{int(totals['started'] or 0)}</b>",
+            f"✅ Успешно: <b>{int(totals['success'] or 0)}</b>",
+            f"❌ Слеты: <b>{int(totals['slips'] or 0)}</b>",
+            f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>",
+            f"🏦 Оборот группы: <b>{usd(totals['turnover_total'] or 0)}</b>",
+        ]
+        if role in {"chief_admin", "admin"}:
+            lines.extend([
+                f"💰 Выплачено юзерам: <b>{usd(totals['paid_total'] or 0)}</b>",
+                f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>",
+                f"📈 Маржа группы: <b>{usd(totals['margin_total'] or 0)}</b>",
+            ])
         if per_operator:
             lines.append("")
             lines.append("<b>📱 По операторам</b>")
@@ -4411,12 +4484,11 @@ async def group_stata(message: Message):
                 lines.append(
                     f"• {op_text(row['operator_key'])}: <b>{int(row['total'] or 0)}</b> "
                     f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)}) • "
-                    f"💰 <b>{usd(row['paid_total'] or 0)}</b>"
+                    f"на сумму <b>{usd(row['turnover_total'] or 0)}</b>"
                 )
-        await message.answer("<b>📊 Статистика этой группы / топика</b>\n\n" + "\n".join(lines))
+        await message.answer("\n".join(lines))
     except Exception:
         await message.answer("⚠️ Не удалось собрать статистику группы. Смотрите её через кнопку в /admin.")
-
 
 @router.callback_query(F.data == "admin:set_withdraw_channel")
 async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
