@@ -1,6 +1,7 @@
 import asyncio
 import html
 import io
+import json
 import logging
 import re
 import sqlite3
@@ -20,7 +21,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ForceReply
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ForceReply, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
@@ -49,6 +50,7 @@ CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
 
 OPERATORS = {
     "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
+    "mts_premium": {"title": "МТС Салон", "price": 4.00, "command": "/mtspremium"},
     "bil": {"title": "Билайн", "price": 4.50, "command": "/bil"},
     "mega": {"title": "Мегафон", "price": 5.00, "command": "/mega"},
     "t2": {"title": "Tele2", "price": 4.20, "command": "/t2"},
@@ -120,6 +122,9 @@ class AdminStates(StatesGroup):
     waiting_db_upload = State()
     waiting_channel_value = State()
     waiting_backup_channel = State()
+    waiting_required_join_link = State()
+    waiting_required_join_item = State()
+    waiting_required_join_remove = State()
 
 
 @dataclass
@@ -152,6 +157,8 @@ class QueueItem:
     charge_chat_id: Optional[int] = None
     charge_thread_id: Optional[int] = None
     charge_amount: Optional[float] = None
+    user_hold_chat_id: Optional[int] = None
+    user_hold_message_id: Optional[int] = None
 
     @classmethod
     def from_row(cls, row):
@@ -950,6 +957,135 @@ def time_left_text(hold_until: Optional[str]) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def required_join_entries() -> list[dict]:
+    raw = (db.get_setting("required_join_items", "") or "").strip()
+    items = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    chat_id = item.get("chat_id")
+                    link = (item.get("link") or "").strip()
+                    title = (item.get("title") or "").strip()
+                    try:
+                        chat_id = int(chat_id)
+                    except Exception:
+                        continue
+                    if chat_id:
+                        items.append({"chat_id": chat_id, "link": link, "title": title})
+        except Exception:
+            logging.exception("failed to parse required_join_items")
+    if items:
+        return items
+
+    # backward compatibility with old single-group settings
+    try:
+        legacy_chat_id = int(db.get_setting("required_join_chat_id", "0") or 0)
+    except Exception:
+        legacy_chat_id = 0
+    legacy_link = (db.get_setting("required_join_link", "") or "").strip()
+    if legacy_chat_id:
+        return [{"chat_id": legacy_chat_id, "link": legacy_link, "title": ""}]
+    return []
+
+def save_required_join_entries(items: list[dict]):
+    normalized = []
+    seen = set()
+    for item in items:
+        try:
+            chat_id = int(item.get("chat_id"))
+        except Exception:
+            continue
+        if not chat_id or chat_id in seen:
+            continue
+        seen.add(chat_id)
+        normalized.append({
+            "chat_id": chat_id,
+            "link": (item.get("link") or "").strip(),
+            "title": (item.get("title") or "").strip(),
+        })
+    db.set_setting("required_join_items", json.dumps(normalized, ensure_ascii=False))
+    # keep legacy fields in sync with the first item
+    if normalized:
+        db.set_setting("required_join_chat_id", str(normalized[0]["chat_id"]))
+        db.set_setting("required_join_link", normalized[0]["link"])
+    else:
+        db.set_setting("required_join_chat_id", "0")
+        db.set_setting("required_join_link", "")
+
+def render_required_join_admin() -> str:
+    items = required_join_entries()
+    lines = ["<b>👥 Обязательная подписка</b>", ""]
+    if not items:
+        lines.append("Сейчас обязательная подписка <b>выключена</b>.")
+    else:
+        lines.append(f"Подписок в списке: <b>{len(items)}</b>")
+        lines.append("")
+        for idx, item in enumerate(items, 1):
+            title = escape(item.get("title") or f"Канал {idx}")
+            lines.append(f"<b>{idx}.</b> {title}")
+            lines.append(f"ID: <code>{item['chat_id']}</code>")
+            if item.get("link"):
+                lines.append(f"Ссылка: <code>{escape(item['link'])}</code>")
+            lines.append("")
+    lines.append("Формат добавления: <code>-100xxxxxxxxxx | https://t.me/your_link | Название</code>")
+    lines.append("Название можно не указывать.")
+    return "\n".join(lines).strip()
+
+def required_join_chat_id() -> int:
+    items = required_join_entries()
+    return int(items[0]["chat_id"]) if items else 0
+
+def required_join_link() -> str:
+    items = required_join_entries()
+    return (items[0].get("link") or "").strip() if items else ""
+
+def subscription_required_enabled() -> bool:
+    return bool(required_join_entries())
+
+async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
+    items = required_join_entries()
+    if not items:
+        return True
+    for item in items:
+        try:
+            member = await bot.get_chat_member(int(item["chat_id"]), user_id)
+            if getattr(member, 'status', '') not in {'creator', 'administrator', 'member', 'restricted'}:
+                return False
+        except Exception:
+            logging.exception('required group membership check failed for user_id=%s chat_id=%s', user_id, item.get("chat_id"))
+            return False
+    return True
+
+def required_join_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for item in required_join_entries()[:10]:
+        link = (item.get("link") or "").strip()
+        if not link:
+            continue
+        title = (item.get("title") or "").strip() or f"Канал {str(item['chat_id'])[-4:]}"
+        kb.row(InlineKeyboardButton(text=f'👥 {title}', url=link))
+    kb.button(text='✅ Проверить подписку', callback_data='join:check')
+    kb.adjust(1)
+    return kb
+
+async def ensure_required_subscription_entity(entity, bot: Bot, user_id: int) -> bool:
+    if not subscription_required_enabled():
+        return True
+    joined = await is_user_joined_required_group(bot, user_id)
+    if joined:
+        return True
+    text = (
+        '<b>🔒 Доступ ограничен</b>\n\n'
+        'Для использования бота нужна обязательная подписка на группу.\n\n'
+        'После вступления нажмите <b>«Проверить подписку»</b>.'
+    )
+    await send_banner_message(entity, db.get_setting('start_banner_path', START_BANNER), text, required_join_kb().as_markup())
+    return False
+
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📲 Сдать номер", callback_data="menu:submit")
@@ -1683,7 +1819,10 @@ def render_admin_settings() -> str:
         f"📥 Приём номеров: <b>{'Включен' if is_numbers_enabled() else 'Выключен'}</b>\n"
         f"📝 Старт-заголовок: <b>{escape(db.get_setting('start_title', 'ESIM Service X'))}</b>\n"
         f"💸 Канал выплат: <code>{escape(db.get_setting('withdraw_channel_id', str(WITHDRAW_CHANNEL_ID)))}</code>\n"
+        f"🧵 Топик выплат: <code>{escape(db.get_setting('withdraw_thread_id', '0'))}</code>\n"
         f"🧾 Канал логов: <code>{escape(db.get_setting('log_channel_id', str(LOG_CHANNEL_ID)))}</code>\n"
+        f"👥 Обяз. группа: <code>{escape(db.get_setting('required_join_chat_id', '0'))}</code>\n"
+        f"🔗 Ссылка вступления: <code>{escape(db.get_setting('required_join_link', ''))}</code>\n"
         f"🗄 Канал автобэкапа: <code>{escape(db.get_setting('backup_channel_id', '0'))}</code>\n"
         f"🔁 Автовыгрузка БД: <b>{'Включена' if is_backup_enabled() else 'Выключена'}</b>\n"
         f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
@@ -1722,11 +1861,22 @@ def settings_kb():
     kb.button(text="✍️ Старт-текст", callback_data="admin:set_start_text")
     kb.button(text="📣 Рассылка", callback_data="admin:broadcast")
     kb.button(text="💳 Канал выплат", callback_data="admin:set_withdraw_channel")
+    kb.button(text="🧵 Топик выплат", callback_data="admin:set_withdraw_topic")
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
+    kb.button(text="👥 Обяз. подписка", callback_data="admin:required_join_manage")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
+    return kb.as_markup()
+
+def required_join_manage_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить канал", callback_data="admin:required_join_add")
+    kb.button(text="➖ Убрать канал", callback_data="admin:required_join_remove")
+    kb.button(text="🧹 Очистить все", callback_data="admin:required_join_clear")
+    kb.button(text="↩️ Назад", callback_data="admin:settings")
+    kb.adjust(2, 1, 1)
     return kb.as_markup()
 
 def operator_modes_kb():
@@ -1879,6 +2029,10 @@ def ensure_extra_schema():
         cur.execute("ALTER TABLE queue_items ADD COLUMN charge_thread_id INTEGER")
     if 'charge_amount' not in qi_cols:
         cur.execute("ALTER TABLE queue_items ADD COLUMN charge_amount REAL")
+    if 'user_hold_chat_id' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_chat_id INTEGER")
+    if 'user_hold_message_id' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_message_id INTEGER")
     if 'payout_check_id' not in wd_cols:
         cur.execute("ALTER TABLE withdrawals ADD COLUMN payout_check_id INTEGER")
     defaults = {
@@ -2186,6 +2340,7 @@ async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=Non
 
 CUSTOM_OPERATOR_EMOJI = {
     "mts": ("5312126452043363774", "🔴"),
+    "mts_premium": ("5312126452043363774", "🔴"),
     "mega": ("5229218997521631084", "🟢"),
     "bil": ("5280919528908267119", "🟡"),
     "t2": ("5244453379664534900", "⚫"),
@@ -2405,6 +2560,8 @@ async def delete_crypto_check(check_id: int) -> tuple[bool, str]:
 async def start_cmd(message: Message, state: FSMContext):
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
     await state.clear()
+    if not await ensure_required_subscription_entity(message, message.bot, message.from_user.id):
+        return
     if is_user_blocked(message.from_user.id):
         await remove_reply_keyboard(message)
         await message.answer(blocked_text())
@@ -2417,10 +2574,23 @@ async def start_cmd(message: Message, state: FSMContext):
 async def noop(callback: CallbackQuery):
     await callback.answer()
 
+@router.callback_query(F.data == "join:check")
+async def join_check(callback: CallbackQuery, state: FSMContext):
+    if await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await state.clear()
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+        await callback.answer('Подписка подтверждена')
+        return
+    await callback.answer('Подписка пока не найдена', show_alert=True)
+
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, state: FSMContext):
     touch_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.full_name)
     await state.clear()
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
     if is_user_blocked(callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
     else:
@@ -2503,6 +2673,10 @@ async def mirror_token_received(message: Message, state: FSMContext):
 @router.callback_query(F.data == "menu:my")
 async def menu_my(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
     items = user_today_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
     await callback.answer()
@@ -2510,12 +2684,20 @@ async def menu_my(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "menu:profile")
 async def menu_profile(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
     await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "menu:withdraw")
 async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
     payout_link = db.get_payout_link(callback.from_user.id)
     if not payout_link:
         kb = InlineKeyboardBuilder()
@@ -2580,6 +2762,10 @@ async def submit_more(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
     if is_user_blocked(callback.from_user.id):
         await callback.answer("Аккаунт заблокирован", show_alert=True)
         return
@@ -2692,7 +2878,18 @@ async def submit_qr(message: Message, state: FSMContext):
         mode,
         getattr(message.bot, "token", BOT_TOKEN),
     )
-    await state.clear()
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await send_log(
+        message.bot,
+        f"<b>📥 Новая ESIM заявка</b>\n"
+        f"👤 Отправил: <b>{escape(message.from_user.full_name)}</b>\n"
+        f"🆔 <code>{message.from_user.id}</code>\n"
+        f"🔗 Username: <b>{escape('@' + message.from_user.username) if message.from_user.username else '—'}</b>\n"
+        f"🧾 Заявка: <b>#{item_id}</b>\n"
+        f"📱 {op_html(operator_key)}\n"
+        f"📞 <code>{escape(pretty_phone(phone))}</code>\n"
+        f"🔄 {mode_label(mode)}"
+    )
     await message.answer(
         "<b>✅ Заявка принята</b>\n\n"
         f"🧾 ID заявки: <b>{item_id}</b>\n"
@@ -2808,7 +3005,8 @@ async def withdraw_confirm(callback: CallbackQuery):
         f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}"
     )
     try:
-        await callback.bot.send_message(int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID))), text, reply_markup=withdraw_admin_kb(wd_id))
+        withdraw_thread_id = int(db.get_setting('withdraw_thread_id', '0') or 0)
+        await callback.bot.send_message(int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID))), text, reply_markup=withdraw_admin_kb(wd_id), message_thread_id=(withdraw_thread_id or None))
     except Exception:
         logging.exception("send withdraw to channel failed")
     await callback.message.edit_text("✅ Заявка на вывод создана. Она отправлена в канал выплат.")
@@ -3668,6 +3866,16 @@ async def hold_watcher(bot: Bot):
                             caption=queue_caption(item),
                             reply_markup=admin_queue_kb(item),
                         )
+                        if getattr(item, 'user_hold_chat_id', None) and getattr(item, 'user_hold_message_id', None):
+                            try:
+                                await bot.edit_message_caption(
+                                    chat_id=item.user_hold_chat_id,
+                                    message_id=item.user_hold_message_id,
+                                    caption=queue_caption(item),
+                                    reply_markup=None,
+                                )
+                            except Exception:
+                                pass
                         db.touch_timer_render(item.id)
                 except Exception:
                     pass
@@ -3692,12 +3900,23 @@ async def hold_watcher(bot: Bot):
                     except Exception:
                         pass
                     try:
+                        final_item = db.get_queue_item(item.id) or item
                         await bot.edit_message_caption(
                             chat_id=item.work_chat_id,
                             message_id=item.work_message_id,
-                            caption=queue_caption(db.get_queue_item(item.id) or item) + "\n\n✅ <b>Холд завершён. Номер оплачен.</b>",
+                            caption=queue_caption(final_item) + "\n\n✅ <b>Холд завершён. Номер оплачен.</b>",
                             reply_markup=None,
                         )
+                        if getattr(item, 'user_hold_chat_id', None) and getattr(item, 'user_hold_message_id', None):
+                            try:
+                                await bot.edit_message_caption(
+                                    chat_id=item.user_hold_chat_id,
+                                    message_id=item.user_hold_message_id,
+                                    caption=queue_caption(final_item) + "\n\n✅ <b>Холд завершён. Номер оплачен.</b>",
+                                    reply_markup=None,
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 except Exception:
@@ -4029,15 +4248,21 @@ async def take_start_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            fresh,
-            "<b>✅ Номер — Встал ✅</b>\n\n"
-            "🚀 <b>По вашему номеру началась работа</b>\n\n"
-            f"📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n"
-            f"📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n"
-            f"{mode_emoji(fresh.mode)} <b>Режим:</b> {mode_label(fresh.mode)}"
-        )
+        if fresh.mode == 'hold':
+            user_msg = await send_queue_item_photo_to_chat(callback.bot, int(fresh.user_id), fresh, queue_caption(fresh), message_thread_id=None)
+            if user_msg:
+                db.conn.execute("UPDATE queue_items SET user_hold_chat_id=?, user_hold_message_id=? WHERE id=?", (int(fresh.user_id), int(user_msg.message_id), fresh.id))
+                db.conn.commit()
+        else:
+            await send_item_user_message(
+                callback.bot,
+                fresh,
+                "<b>✅ Номер — Встал ✅</b>\n\n"
+                "🚀 <b>По вашему номеру началась работа</b>\n\n"
+                f"📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n"
+                f"📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n"
+                f"{mode_emoji(fresh.mode)} <b>Режим:</b> {mode_label(fresh.mode)}"
+            )
     except Exception:
         pass
     await send_log(callback.bot, f"<b>🚀 Работа началась</b>\n👤 Взял: {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{fresh.id}</b>\n📱 {op_html(fresh.operator_key)}\n📞 <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n🔄 {mode_label(fresh.mode)}")
@@ -4138,11 +4363,22 @@ async def slip_cb(callback: CallbackQuery):
     except Exception:
         pass
     try:
-        await send_item_user_message(
-            callback.bot,
-            item,
-            f"<b>❌ Номер слетел</b>\n\n📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
-        )
+        if getattr(item, 'user_hold_chat_id', None) and getattr(item, 'user_hold_message_id', None):
+            try:
+                await callback.bot.edit_message_caption(
+                    chat_id=item.user_hold_chat_id,
+                    message_id=item.user_hold_message_id,
+                    caption=slip_text,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+        else:
+            await send_item_user_message(
+                callback.bot,
+                item,
+                f"<b>❌ Номер слетел</b>\n\n📞 <b>Номер:</b> <code>{escape(pretty_phone(item.normalized_phone))}</code>\n⏱ <b>Время работы:</b> {worked}\n▫️ <b>Холд осталось:</b> {remain}\n\n❌ <b>Оплата за номер не начислена.</b>"
+            )
     except Exception:
         pass
     await send_log(callback.bot, f"<b>❌ Слет</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>\n📱 {op_html(item.operator_key)}")
@@ -4538,6 +4774,121 @@ async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_channel_value)
     await callback.message.answer("Введите новый <b>ID канала логов</b>:")
     await callback.answer()
+
+@router.callback_query(F.data == "admin:required_join_manage")
+async def admin_required_join_manage(callback: CallbackQuery):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    await safe_edit_or_send(callback, render_required_join_admin(), reply_markup=required_join_manage_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:required_join_add")
+async def admin_required_join_add(callback: CallbackQuery, state: FSMContext):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_required_join_item)
+    await callback.message.answer(
+        "Пришли новый канал в формате:\n"
+        "<code>-100xxxxxxxxxx | https://t.me/your_link | Название</code>\n\n"
+        "Название можно не указывать. Для отмены отправь <code>-</code>."
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:required_join_remove")
+async def admin_required_join_remove(callback: CallbackQuery, state: FSMContext):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    items = required_join_entries()
+    if not items:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_required_join_remove)
+    lines = ["Что убрать? Отправь <b>номер из списка</b> или <b>ID канала</b>.", ""]
+    for idx, item in enumerate(items, 1):
+        title = escape(item.get("title") or f"Канал {idx}")
+        lines.append(f"{idx}. {title} — <code>{item['chat_id']}</code>")
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:required_join_clear")
+async def admin_required_join_clear(callback: CallbackQuery):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    save_required_join_entries([])
+    await safe_edit_or_send(callback, render_required_join_admin(), reply_markup=required_join_manage_kb())
+    await callback.answer("Список очищен")
+
+@router.message(AdminStates.waiting_required_join_item)
+async def admin_required_join_item_value(message: Message, state: FSMContext):
+    if user_role(message.from_user.id) != "chief_admin":
+        await state.clear()
+        return
+    raw = (message.text or '').strip()
+    if raw == '-':
+        await state.clear()
+        await message.answer('Отменено.')
+        return
+    parts = [part.strip() for part in raw.split('|')]
+    if not parts or not parts[0].lstrip('-').isdigit():
+        await message.answer('Нужен формат: <code>-100xxxxxxxxxx | https://t.me/link | Название</code>')
+        return
+    chat_id = int(parts[0])
+    link = parts[1] if len(parts) > 1 else ''
+    title = parts[2] if len(parts) > 2 else ''
+    items = required_join_entries()
+    replaced = False
+    for item in items:
+        if int(item['chat_id']) == chat_id:
+            item['link'] = link or item.get('link', '')
+            item['title'] = title or item.get('title', '')
+            replaced = True
+            break
+    if not replaced:
+        items.append({'chat_id': chat_id, 'link': link, 'title': title})
+    save_required_join_entries(items)
+    await state.clear()
+    await message.answer('✅ Канал обязательной подписки сохранён.')
+
+@router.message(AdminStates.waiting_required_join_remove)
+async def admin_required_join_remove_value(message: Message, state: FSMContext):
+    if user_role(message.from_user.id) != "chief_admin":
+        await state.clear()
+        return
+    raw = (message.text or '').strip()
+    items = required_join_entries()
+    target_chat_id = None
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(items):
+            target_chat_id = int(items[idx - 1]['chat_id'])
+    if target_chat_id is None and raw.lstrip('-').isdigit():
+        target_chat_id = int(raw)
+    if target_chat_id is None:
+        await message.answer('Отправь номер из списка или ID канала.')
+        return
+    new_items = [item for item in items if int(item['chat_id']) != target_chat_id]
+    save_required_join_entries(new_items)
+    await state.clear()
+    await message.answer('✅ Канал убран из обязательной подписки.')
+
+@router.message(AdminStates.waiting_required_join_link)
+async def admin_required_join_link_value(message: Message, state: FSMContext):
+    if user_role(message.from_user.id) != "chief_admin":
+        await state.clear()
+        return
+    raw = (message.text or '').strip()
+    items = required_join_entries()
+    if not items:
+        db.set_setting('required_join_link', '' if raw == '-' else raw)
+    else:
+        items[0]['link'] = '' if raw == '-' else raw
+        save_required_join_entries(items)
+    await state.clear()
+    await message.answer('✅ Ссылка сохранена.')
 
 @router.message(AdminStates.waiting_channel_value)
 async def admin_channel_value(message: Message, state: FSMContext):
