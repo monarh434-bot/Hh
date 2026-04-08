@@ -4748,10 +4748,8 @@ async def admin_set_withdraw_topic(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_channel_value)
     current_value = escape(db.get_setting("withdraw_thread_id", "0"))
     await callback.message.answer(
-        "Введите новый <b>ID топика выплат</b>:
-"
-        "Отправь <code>0</code>, чтобы отключить топик и слать выплаты просто в канал.
-"
+        "Введите новый <b>ID топика выплат</b>:\n"
+        "Отправь <code>0</code>, чтобы отключить топик и слать выплаты просто в канал.\n"
         f"Текущее значение: <code>{current_value}</code>"
     )
     await callback.answer()
