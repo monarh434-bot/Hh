@@ -1547,20 +1547,12 @@ def render_start(user_id: int) -> str:
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
     description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
     price_lines = [
-        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mts', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold', user_id))}</b> / <b>{usd(get_mode_price('bil', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mega', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold', user_id))}</b> / <b>{usd(get_mode_price('t2', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold', user_id))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold', user_id))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html(key)} <b>{escape(data['title'])}</b> — <b>{usd(get_mode_price(key, 'hold', user_id))}</b> / <b>{usd(get_mode_price(key, 'no_hold', user_id))}</b>"
+        for key, data in OPERATORS.items()
     ]
     queue_lines = [
-        f"{op_emoji_html('mts')} <b>МТС:</b> {count_waiting_mode('mts', 'hold')} / {count_waiting_mode('mts', 'no_hold')}",
-        f"{op_emoji_html('bil')} <b>Билайн:</b> {count_waiting_mode('bil', 'hold')} / {count_waiting_mode('bil', 'no_hold')}",
-        f"{op_emoji_html('mega')} <b>Мегафон:</b> {count_waiting_mode('mega', 'hold')} / {count_waiting_mode('mega', 'no_hold')}",
-        f"{op_emoji_html('t2')} <b>Tele2:</b> {count_waiting_mode('t2', 'hold')} / {count_waiting_mode('t2', 'no_hold')}",
-        f"{op_emoji_html('vtb')} <b>ВТБ:</b> {count_waiting_mode('vtb', 'hold')} / {count_waiting_mode('vtb', 'no_hold')}",
-        f"{op_emoji_html('gaz')} <b>Газпром:</b> {count_waiting_mode('gaz', 'hold')} / {count_waiting_mode('gaz', 'no_hold')}",
+        f"{op_emoji_html(key)} <b>{escape(data['title'])}:</b> {count_waiting_mode(key, 'hold')} / {count_waiting_mode(key, 'no_hold')}"
+        for key, data in OPERATORS.items()
     ]
     return (
         f"<b>💫 {title} 💫</b>\n"
@@ -1590,12 +1582,8 @@ def render_profile(user_id: int) -> str:
         for row in ops
     ) or "• <i>Пока пусто</i>"
     personal_price_lines = [
-        f"{op_emoji_html('mts')} <b>МТС</b> — <b>{usd(get_mode_price('mts', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mts', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('bil')} <b>Билайн</b> — <b>{usd(get_mode_price('bil', 'hold', user_id))}</b> / <b>{usd(get_mode_price('bil', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('mega')} <b>Мегафон</b> — <b>{usd(get_mode_price('mega', 'hold', user_id))}</b> / <b>{usd(get_mode_price('mega', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('t2')} <b>Tele2</b> — <b>{usd(get_mode_price('t2', 'hold', user_id))}</b> / <b>{usd(get_mode_price('t2', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('vtb')} <b>ВТБ</b> — <b>{usd(get_mode_price('vtb', 'hold', user_id))}</b> / <b>{usd(get_mode_price('vtb', 'no_hold', user_id))}</b>",
-        f"{op_emoji_html('gaz')} <b>Газпром</b> — <b>{usd(get_mode_price('gaz', 'hold', user_id))}</b> / <b>{usd(get_mode_price('gaz', 'no_hold', user_id))}</b>",
+        f"{op_emoji_html(key)} <b>{escape(data['title'])}</b> — <b>{usd(get_mode_price(key, 'hold', user_id))}</b> / <b>{usd(get_mode_price(key, 'no_hold', user_id))}</b>"
+        for key, data in OPERATORS.items()
     ]
     return (
         "<b>👤 Личный кабинет - ESIM Service X 💫</b>\n\n"
