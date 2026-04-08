@@ -4739,6 +4739,24 @@ async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:set_withdraw_topic")
+async def admin_set_withdraw_topic(callback: CallbackQuery, state: FSMContext):
+    if not is_chief_admin(callback.from_user.id):
+        await callback.answer("Только главный админ", show_alert=True)
+        return
+    await state.update_data(channel_target="withdraw_thread_id")
+    await state.set_state(AdminStates.waiting_channel_value)
+    current_value = escape(db.get_setting("withdraw_thread_id", "0"))
+    await callback.message.answer(
+        "Введите новый <b>ID топика выплат</b>:
+"
+        "Отправь <code>0</code>, чтобы отключить топик и слать выплаты просто в канал.
+"
+        f"Текущее значение: <code>{current_value}</code>"
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:set_backup_channel")
 async def admin_set_backup_channel(callback: CallbackQuery, state: FSMContext):
     if not is_chief_admin(callback.from_user.id):
