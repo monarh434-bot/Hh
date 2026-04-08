@@ -1995,12 +1995,22 @@ def looks_like_payout_link(raw: str) -> bool:
         "http://t.me/send?start=",
         "telegram.me/send?start=",
         "https://telegram.me/send?start=",
+        "t.me/cryptobot?start=",
+        "https://t.me/cryptobot?start=",
+        "t.me/cryptobot/app?startapp=",
+        "https://t.me/cryptobot/app?startapp=",
+        "app.send.tg",
+        "send.tg",
         "send?start=iv",
         "start=iv",
+        "startapp=invoice",
+        "invoice",
     ]
     if any(p in lowered for p in patterns):
         return True
     if "@send" in lowered or "@cryptobot" in lowered:
+        return True
+    if ("t.me/" in lowered or "telegram.me/" in lowered) and ("start=" in lowered or "startapp=" in lowered):
         return True
     return False
 
@@ -2993,23 +3003,66 @@ async def withdraw_confirm(callback: CallbackQuery):
     if amount > balance:
         await callback.answer("Недостаточно средств на балансе", show_alert=True)
         return
+    payout_link = (db.get_payout_link(callback.from_user.id) or "").strip()
+    if not payout_link:
+        await callback.answer("Сначала привяжите счёт для выплат", show_alert=True)
+        return
     db.subtract_balance(callback.from_user.id, amount)
     wd_id = db.create_withdrawal(callback.from_user.id, amount)
-    payout_link = db.get_payout_link(callback.from_user.id) or "—"
+    username_line = f"\n🔹 Username: @{escape(callback.from_user.username)}" if callback.from_user.username else ""
     text = (
         "<b>📨 Новая заявка на вывод</b>\n\n"
         f"🧾 ID: <b>{wd_id}</b>\n"
-        f"👤 Пользователь: <b>{escape(callback.from_user.full_name)}</b>\n"
+        f"👤 Пользователь: <b>{escape(callback.from_user.full_name)}</b>{username_line}\n"
         f"🆔 ID: <code>{callback.from_user.id}</code>\n"
         f"💸 Сумма: <b>{usd(amount)}</b>\n\n"
         f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}"
     )
+    plain_text = (
+        "📨 Новая заявка на вывод\n\n"
+        f"ID: {wd_id}\n"
+        f"Пользователь: {callback.from_user.full_name}"
+        f"{(' @' + callback.from_user.username) if callback.from_user.username else ''}\n"
+        f"ID: {callback.from_user.id}\n"
+        f"Сумма: {usd(amount)}\n\n"
+        f"Счёт для оплаты:\n{payout_link}"
+    )
+    channel_id = int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID)))
+    withdraw_thread_id = int(db.get_setting('withdraw_thread_id', '0') or 0)
+    sent_ok = False
     try:
-        withdraw_thread_id = int(db.get_setting('withdraw_thread_id', '0') or 0)
-        await callback.bot.send_message(int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID))), text, reply_markup=withdraw_admin_kb(wd_id), message_thread_id=(withdraw_thread_id or None))
+        await callback.bot.send_message(
+            channel_id,
+            text,
+            reply_markup=withdraw_admin_kb(wd_id),
+            message_thread_id=(withdraw_thread_id or None),
+        )
+        sent_ok = True
     except Exception:
-        logging.exception("send withdraw to channel failed")
-    await callback.message.edit_text("✅ Заявка на вывод создана. Она отправлена в канал выплат.")
+        logging.exception("send withdraw to channel failed (with topic)")
+    if not sent_ok:
+        try:
+            await callback.bot.send_message(
+                channel_id,
+                text,
+                reply_markup=withdraw_admin_kb(wd_id),
+            )
+            sent_ok = True
+        except Exception:
+            logging.exception("send withdraw to channel failed (without topic)")
+    if not sent_ok:
+        try:
+            await callback.bot.send_message(
+                channel_id,
+                plain_text,
+                reply_markup=withdraw_admin_kb(wd_id),
+            )
+            sent_ok = True
+        except Exception:
+            logging.exception("send withdraw to channel failed (plain text fallback)")
+    await callback.message.edit_text(
+        "✅ Заявка на вывод создана. Она отправлена в канал выплат." if sent_ok else "⚠️ Заявка создана, но сообщение в канал выплат не отправилось. Проверь логи и настройки канала."
+    )
     await send_banner_message(callback.message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
     await callback.answer()
 
@@ -3651,11 +3704,11 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         raise
 
 
-@router.message(Command("mts", "mtc", "bil", "mega", "t2"))
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2"))
 async def legacy_take_commands(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
-    await message.answer("Команды /mts /bil /mega /t2 отключены. Используй <b>/esim</b>.")
+    await message.answer("Команды /mts /mtspremium /mtssalon /bil /mega /t2 отключены. Используй <b>/esim</b>.")
 
 
 
