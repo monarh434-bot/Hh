@@ -126,6 +126,7 @@ class AdminStates(StatesGroup):
     waiting_required_join_item = State()
     waiting_required_join_remove = State()
     waiting_new_operator = State()
+    waiting_remove_operator = State()
 
 
 @dataclass
@@ -205,6 +206,10 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.create_tables()
         self.seed_defaults()
+        try:
+            ensure_extra_schema()
+        except Exception:
+            pass
         return backup_path
 
     def create_tables(self):
@@ -1144,6 +1149,7 @@ def main_menu():
     kb.button(text="📲 Сдать номер", callback_data="menu:submit")
     kb.button(text="📦 Мои номера", callback_data="menu:my")
     kb.button(text="👤 Профиль", callback_data="menu:profile")
+    kb.button(text="🎁 Реф. система", callback_data="menu:ref")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
     kb.button(text="🪞 Зеркало", callback_data="menu:mirror")
     kb.adjust(1)
@@ -1153,6 +1159,7 @@ def main_menu():
 def profile_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Мои номера", callback_data="menu:my")
+    kb.button(text="🎁 Реф. система", callback_data="menu:ref")
     kb.button(text="💳 Изменить счёт", callback_data="menu:payout_link")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
@@ -1593,6 +1600,36 @@ def queue_caption(item: QueueItem) -> str:
     return text
 
 
+def render_referral(user_id: int) -> str:
+    user = db.get_user(user_id)
+    try:
+        ref_count_row = db.conn.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)).fetchone()
+        ref_count = int((ref_count_row['c'] if ref_count_row else 0) or 0)
+    except Exception:
+        ref_count = 0
+    ref_earned = float((user['ref_earned'] if user and 'ref_earned' in user.keys() else 0) or 0)
+    link = referral_link(user_id)
+    return (
+        "<b>🎁 Реферальная система</b>\n\n"
+        + quote_block([
+            "💸 Вы получаете <b>5%</b> с заработка каждого приглашённого пользователя.",
+            f"👥 <b>Ваших рефералов:</b> {ref_count}",
+            f"💰 <b>Заработано по рефке:</b> <b>{usd(ref_earned)}</b>",
+            f"🔗 <b>Ваша ссылка:</b> <code>{escape(link)}</code>",
+        ])
+        + "\n\nОтправьте свою ссылку другу. После его старта бот привяжет его к вам автоматически.\n\n"
+        + "Награда начисляется, когда реферал получает оплату за успешно сданный номер."
+    )
+
+def referral_kb(user_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔗 Обновить", callback_data="menu:ref")
+    kb.button(text="👤 Профиль", callback_data="menu:profile")
+    kb.button(text="🏠 Главное меню", callback_data="menu:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def render_start(user_id: int) -> str:
     user = db.get_user(user_id)
     balance = usd(float(user["balance"] if user else 0))
@@ -1631,8 +1668,11 @@ def render_profile(user_id: int) -> str:
     full_name = escape(user['full_name'] if user else '')
     payout_link = db.get_payout_link(user_id)
     payout_status = "✅ Привязан" if payout_link else "❌ Не привязан"
-    ref_count = db.conn.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)).fetchone()
-    ref_count = int((ref_count['c'] if ref_count else 0) or 0)
+    try:
+        ref_count_row = db.conn.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)).fetchone()
+        ref_count = int((ref_count_row['c'] if ref_count_row else 0) or 0)
+    except Exception:
+        ref_count = 0
     ref_earned = float((user['ref_earned'] if user and 'ref_earned' in user.keys() else 0) or 0)
     ops_text = "\n".join(
         f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
@@ -1661,6 +1701,12 @@ def render_profile(user_id: int) -> str:
             f"⚠️ <b>Ошибки:</b> {int(stats['errors'] or 0)}",
             f"💰 <b>Всего заработано:</b> <b>{usd(stats['earned'] or 0)}</b>",
             f"📤 <b>Сейчас в очередях:</b> {current_queue}",
+        ])
+        + "\n\n<b>🎁 Реферальная система</b>\n"
+        + quote_block([
+            f"👥 <b>Рефералов:</b> {ref_count}",
+            f"💸 <b>Реф. доход:</b> <b>{usd(ref_earned)}</b>",
+            f"🔗 <b>Ссылка:</b> <code>{escape(referral_link(user_id))}</code>",
         ])
         + "\n\n<b>📱 Разбивка по операторам</b>\n"
         + quote_block([ops_text])
@@ -1932,6 +1978,7 @@ def settings_kb():
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
     kb.button(text="👥 Обяз. подписка", callback_data="admin:required_join_manage")
     kb.button(text="➕ Добавить оператора", callback_data="admin:add_operator")
+    kb.button(text="➖ Удалить оператора", callback_data="admin:remove_operator")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="📤 Скачать БД", callback_data="admin:download_db")
@@ -2875,6 +2922,16 @@ async def menu_profile(callback: CallbackQuery, state: FSMContext):
     await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
     await callback.answer()
 
+@router.callback_query(F.data == "menu:ref")
+async def menu_ref(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
+    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_referral(callback.from_user.id), referral_kb(callback.from_user.id))
+    await callback.answer()
+
 @router.callback_query(F.data == "menu:withdraw")
 async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -3591,6 +3648,25 @@ async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:remove_operator")
+async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_remove_operator)
+    removable = []
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    for key, data in OPERATORS.items():
+        if key not in base_keys:
+            removable.append(f"• <code>{key}</code> — {escape(data.get('title', key))}")
+    removable_text = "\n".join(removable) if removable else "• Нет добавленных операторов для удаления."
+    await callback.message.answer(
+        "<b>➖ Удаление оператора</b>\n\n"
+        "Отправьте <code>key</code> оператора, которого нужно удалить.\n\n"
+        f"{removable_text}\n\n"
+        "Базовых операторов удалить нельзя."
+    )
+    await callback.answer()
+
 @router.callback_query(F.data == "admin:set_hold")
 async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -3737,6 +3813,40 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key})", reply_markup=admin_root_kb())
 
+
+@router.message(AdminStates.waiting_remove_operator)
+async def admin_remove_operator_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    key = re.sub(r'[^a-z0-9_]+', '', (message.text or '').strip().lower())
+    if not key:
+        await message.answer("Отправьте key оператора.")
+        return
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    if key in base_keys:
+        await message.answer("Базового оператора удалить нельзя.")
+        return
+    if key not in OPERATORS:
+        await message.answer("Оператор не найден.")
+        return
+    extra_raw = db.get_setting('extra_operators_json', '[]') or '[]'
+    try:
+        extra_items = json.loads(extra_raw)
+    except Exception:
+        extra_items = []
+    if not isinstance(extra_items, list):
+        extra_items = []
+    extra_items = [item for item in extra_items if not (isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key)]
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    title = OPERATORS.get(key, {}).get('title', key)
+    try:
+        del OPERATORS[key]
+    except Exception:
+        pass
+    db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
+    db.conn.commit()
+    await state.clear()
+    await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
 
 @router.message(AdminStates.waiting_hold)
 async def admin_hold_value(message: Message, state: FSMContext):
