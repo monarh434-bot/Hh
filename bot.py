@@ -172,10 +172,40 @@ class QueueItem:
 
 class Database:
     def __init__(self, path: str):
+        self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.create_tables()
         self.seed_defaults()
+
+    def reconnect(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+
+    def replace_with_uploaded_db(self, uploaded_path: str):
+        temp_uploaded = Path(uploaded_path)
+        backup_path = Path(self.path + '.backup')
+        current_path = Path(self.path)
+        if current_path.exists():
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+            shutil.copyfile(current_path, backup_path)
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        shutil.move(str(temp_uploaded), self.path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.create_tables()
+        self.seed_defaults()
+        return backup_path
 
     def create_tables(self):
         cur = self.conn.cursor()
@@ -1904,6 +1934,8 @@ def settings_kb():
     kb.button(text="➕ Добавить оператора", callback_data="admin:add_operator")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
+    kb.button(text="📤 Скачать БД", callback_data="admin:download_db")
+    kb.button(text="📥 Загрузить БД", callback_data="admin:upload_db")
     kb.button(text="↩️ Назад", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -3506,6 +3538,26 @@ async def admin_usernames(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:download_db")
+async def admin_download_db(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    path = Path(DB_PATH)
+    if not path.exists():
+        await callback.answer("База не найдена", show_alert=True)
+        return
+    await callback.message.answer_document(FSInputFile(path), caption="<b>📦 SQLite база</b>")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:upload_db")
+async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_db_upload)
+    await callback.message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:set_start_text")
 async def admin_set_start_text(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -4899,7 +4951,7 @@ async def db_upload_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.set_state(AdminStates.waiting_db_upload)
-    await message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code> или <code>.sqlite</code>.")
+    await message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
 
 @router.message(AdminStates.waiting_db_upload, F.document)
 async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
@@ -4908,30 +4960,38 @@ async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
         return
     doc = message.document
     name = (doc.file_name or "").lower()
-    if not (name.endswith(".db") or name.endswith(".sqlite")):
-        await message.answer("Пришлите именно файл базы <code>.db</code> или <code>.sqlite</code>.")
+    if not (name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3")):
+        await message.answer("Пришлите именно файл базы <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
         return
     temp_path = Path(DB_PATH + ".uploaded")
+    temp_path.unlink(missing_ok=True)
     await bot.download(doc, destination=temp_path)
     try:
         import sqlite3 as _sqlite3
         conn = _sqlite3.connect(str(temp_path))
+        conn.execute("PRAGMA integrity_check").fetchone()
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
         conn.close()
     except Exception:
         temp_path.unlink(missing_ok=True)
         await message.answer("❌ Файл не похож на SQLite базу.")
         return
-    backup_path = Path(DB_PATH + ".backup")
-    if Path(DB_PATH).exists():
-        shutil.copyfile(DB_PATH, backup_path)
-    shutil.move(str(temp_path), DB_PATH)
+    try:
+        backup_path = db.replace_with_uploaded_db(str(temp_path))
+    except Exception:
+        logging.exception("db_upload_receive failed")
+        temp_path.unlink(missing_ok=True)
+        await message.answer("❌ Не удалось загрузить базу. Посмотрите лог бота.")
+        return
     await state.clear()
-    await message.answer("<b>✅ База загружена</b>\n\nПерезапустите Railway, чтобы бот подхватил новую базу.")
+    await message.answer(
+        "<b>✅ База загружена</b>\n\n"
+        f"Текущая база заменена сразу. Резервная копия: <code>{escape(str(backup_path))}</code>"
+    )
 
 @router.message(AdminStates.waiting_db_upload)
 async def db_upload_wrong(message: Message):
-    await message.answer("Пришлите файл базы <code>.db</code> или <code>.sqlite</code>.")
+    await message.answer("Пришлите файл базы <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
 
 
 @router.message(Command("stata"))
