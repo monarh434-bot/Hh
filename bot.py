@@ -129,6 +129,7 @@ class AdminStates(StatesGroup):
     waiting_required_join_item = State()
     waiting_required_join_remove = State()
     waiting_new_operator = State()
+    waiting_new_operator_emoji = State()
     waiting_remove_operator = State()
     waiting_remove_group = State()
 
@@ -1226,12 +1227,18 @@ def operators_group_kb(chat_id: int, thread_id: int | None, mode: str = "hold", 
     kb.adjust(1)
     return kb.as_markup()
 
-def esim_mode_kb():
+def esim_mode_kb(user_id: int | None = None):
     kb = InlineKeyboardBuilder()
     kb.button(text="⏳ Холд", callback_data="esim_mode:hold")
     kb.button(text="⚡ БезХолд", callback_data="esim_mode:no_hold")
-    kb.button(text="🏠 Закрыть", callback_data="noop")
-    kb.adjust(2, 1)
+    if user_id is not None and is_admin(user_id):
+        kb.button(text="➕ Добавить оператора", callback_data="esim:add_operator")
+        kb.button(text="➖ Удалить оператора", callback_data="esim:remove_operator")
+        kb.button(text="🏠 Закрыть", callback_data="noop")
+        kb.adjust(2, 2, 1)
+    else:
+        kb.button(text="🏠 Закрыть", callback_data="noop")
+        kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -1349,14 +1356,16 @@ def group_stats_list_kb():
         seen.add(key)
         prefix = "⏳ " if mode == "hold" else ("⚡ " if mode == "no_hold" else "💬 ")
         label = f"{prefix}{chat_id}" + (f" / topic {thread_id}" if thread_id else "")
-        kb.button(text=label[:60], callback_data=f"admin:groupstat:{chat_id}:{thread_id or 0}")
+        kb.button(text=label[:52], callback_data=f"admin:groupstat:{chat_id}:{thread_id or 0}")
+        kb.button(text="🗑 Удалить", callback_data=f"admin:group_remove:{chat_id}:{thread_id or 0}")
 
     if not seen:
         kb.button(text="• Пока нет рабочих групп", callback_data="admin:home")
-    kb.button(text="↩️ Назад", callback_data="admin:home")
-    kb.adjust(1)
+        kb.adjust(1)
+    else:
+        kb.button(text="↩️ Назад", callback_data="admin:home")
+        kb.adjust(*([2] * len(seen)), 1)
     return kb.as_markup()
-
 def group_finance_list_kb():
     kb = InlineKeyboardBuilder()
     seen = set()
@@ -2004,8 +2013,6 @@ def settings_kb():
     kb.button(text="🧵 Топик выплат", callback_data="admin:set_withdraw_topic")
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
     kb.button(text="👥 Обяз. подписка", callback_data="admin:required_join_manage")
-    kb.button(text="➕ Добавить оператора", callback_data="admin:add_operator")
-    kb.button(text="➖ Удалить оператора", callback_data="admin:remove_operator")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="📤 Скачать БД", callback_data="admin:download_db")
@@ -3749,7 +3756,7 @@ async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_new_operator)
     await callback.message.answer(
-        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nЕсли команду не указать, будет использовано <code>/key</code>."
+        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nПосле этого бот отдельно попросит <b>premium emoji ID</b> для оператора.\nЕсли команду не указать, будет использовано <code>/key</code>."
     )
     await callback.answer()
 
@@ -3867,7 +3874,7 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     raw = (message.text or '').strip()
     parts = [x.strip() for x in raw.split('|')]
     if len(parts) < 3:
-        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | 5397... | 💚</code>")
+        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5</code>")
         return
     key = re.sub(r'[^a-z0-9_]+', '', parts[0].lower())
     title = parts[1].strip()
@@ -3879,37 +3886,82 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Цена должна быть числом.")
         return
-    emoji_id = parts[3].strip() if len(parts) >= 4 else ''
-    fallback_emoji = (parts[4].strip() if len(parts) >= 5 else '') or '📱'
-    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    command = f'/{key}'
+    await state.update_data(new_operator_payload={'key': key, 'title': title, 'price': price, 'command': command})
+    await state.set_state(AdminStates.waiting_new_operator_emoji)
+    await message.answer(
+        "<b>Шаг 2/2 — premium emoji</b>\n\n"
+        f"Для оператора <b>{escape(title)}</b> отправьте <b>premium emoji</b>, <b>стикер</b> с ним или просто <b>ID</b>.\n"
+        "Можно отправить <code>skip</code>, если ставить premium emoji не нужно."
+    )
+
+
+@router.message(AdminStates.waiting_new_operator_emoji)
+async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    payload = data.get('new_operator_payload') or {}
+    key = str(payload.get('key', '')).strip().lower()
+    title = str(payload.get('title', '')).strip()
+    command = str(payload.get('command', '')).strip() or f'/{key}'
+    price = payload.get('price', 0)
+    if not key or not title:
+        await state.clear()
+        await message.answer("Не удалось сохранить оператора: потерялись данные формы. Попробуйте добавить заново.")
+        return
+
+    sticker = message.sticker if getattr(message, 'sticker', None) else None
+    custom_ids = extract_custom_emoji_ids(message)
+    raw_text = (message.text or message.caption or '').strip()
+    emoji_id = ''
+    fallback_emoji = '📱'
+
+    if raw_text.lower() not in {'skip', '/skip', 'пропуск', 'нет'}:
+        if sticker and getattr(sticker, 'custom_emoji_id', None):
+            emoji_id = str(sticker.custom_emoji_id)
+            if getattr(sticker, 'emoji', None):
+                fallback_emoji = str(sticker.emoji)[:2] or '📱'
+        elif custom_ids:
+            emoji_id = str(custom_ids[0])
+        elif raw_text:
+            digits = re.sub(r'\D+', '', raw_text)
+            if digits:
+                emoji_id = digits
+            else:
+                await message.answer("Пришлите premium emoji, стикер с ним, ID или <code>skip</code>.")
+                return
+
     extra_items = load_extra_operator_items()
-    payload = {'key': key, 'title': title, 'price': price, 'emoji_id': emoji_id, 'emoji': fallback_emoji}
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    item_payload = {'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': fallback_emoji}
     updated = False
     for item in extra_items:
         if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
-            item.update(payload)
+            item.update(item_payload)
             updated = True
             break
-    if key in base_keys:
+    if not updated and key not in OPERATORS:
+        extra_items.append(item_payload)
+    elif key in OPERATORS and key not in base_keys:
+        if not updated:
+            extra_items.append(item_payload)
+    elif key in base_keys:
         OPERATORS[key]['title'] = title
         OPERATORS[key]['price'] = price
-        if emoji_id or fallback_emoji:
-            CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
-    else:
-        if not updated:
-            extra_items.append(payload)
-        OPERATORS[key] = {'title': title, 'price': price, 'command': f'/{key}'}
-        CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
-    save_extra_operator_items(extra_items)
+        OPERATORS[key]['command'] = command
+
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
     db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+    CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
     await state.clear()
-    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key})", reply_markup=admin_root_kb())
-
-
+    suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • без premium emoji"
+    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key}){suffix}", reply_markup=admin_root_kb())
 @router.message(AdminStates.waiting_remove_operator)
 async def admin_remove_operator_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -4256,7 +4308,15 @@ async def esim_command(message: Message):
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
         return
-    await message.answer(render_esim_picker(), reply_markup=esim_kb())
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id:
+        allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic")
+    else:
+        allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    if not allowed:
+        await message.answer("Эта группа или топик не включены как рабочая зона. Используй /work или /topic.")
+        return
+    await message.answer("<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:", reply_markup=esim_mode_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "menu:payout_link")
@@ -5007,7 +5067,7 @@ async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_new_operator)
     await callback.message.answer(
-        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nЕсли команду не указать, будет использовано <code>/key</code>."
+        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nПосле этого бот отдельно попросит <b>premium emoji ID</b> для оператора.\nЕсли команду не указать, будет использовано <code>/key</code>."
     )
     await callback.answer()
 
@@ -5125,7 +5185,7 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     raw = (message.text or '').strip()
     parts = [x.strip() for x in raw.split('|')]
     if len(parts) < 3:
-        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | /sber</code>")
+        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5</code>")
         return
     key = re.sub(r'[^a-z0-9_]+', '', parts[0].lower())
     title = parts[1].strip()
@@ -5137,9 +5197,7 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Цена должна быть числом.")
         return
-    command = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else f'/{key}'
-    if not command.startswith('/'):
-        command = '/' + command
+    command = f'/{key}'
     extra_items = load_extra_operator_items()
     updated = False
     for item in extra_items:
@@ -5527,7 +5585,7 @@ async def esim_command(message: Message):
     if not allowed:
         await message.answer('Эта группа или топик не включены как рабочая зона. Используй /work или /topic.')
         return
-    await message.answer('<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:', reply_markup=esim_mode_kb())
+    await message.answer('<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:', reply_markup=esim_mode_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "esim:back_mode")
@@ -5535,7 +5593,41 @@ async def esim_back_mode(callback: CallbackQuery):
     if not is_operator_or_admin(callback.from_user.id):
         return
     text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
-    await safe_edit_or_send(callback, text, reply_markup=esim_mode_kb())
+    await safe_edit_or_send(callback, text, reply_markup=esim_mode_kb(callback.from_user.id))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "esim:add_operator")
+async def esim_add_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_new_operator)
+    await callback.message.answer(
+        "<b>➕ Добавление оператора</b>\n\n"
+        "Отправьте данные в формате:\n\n<code>key | Название | цена</code>\n\n"
+        "Пример:\n<code>sber | Сбер | 4.5</code>\n\n"
+        "После этого я попрошу premium emoji ID. Оператор сразу появится в <code>/esim</code>."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "esim:remove_operator")
+async def esim_remove_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_remove_operator)
+    removable = []
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    for key, data in OPERATORS.items():
+        if key not in base_keys:
+            removable.append(f"• <code>{key}</code> — {escape(data.get('title', key))}")
+    removable_text = "\n".join(removable) if removable else "• Нет добавленных операторов для удаления."
+    await callback.message.answer(
+        "<b>➖ Удаление оператора</b>\n\n"
+        "Отправьте <code>key</code> оператора, которого нужно удалить.\n\n"
+        f"{removable_text}\n\n"
+        "Базовых операторов удалить нельзя."
+    )
     await callback.answer()
 
 
