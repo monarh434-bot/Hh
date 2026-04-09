@@ -125,6 +125,7 @@ class AdminStates(StatesGroup):
     waiting_required_join_link = State()
     waiting_required_join_item = State()
     waiting_required_join_remove = State()
+    waiting_new_operator = State()
 
 
 @dataclass
@@ -771,23 +772,31 @@ class Database:
         return amount
 
     def enable_workspace(self, chat_id: int, thread_id: Optional[int], mode: str, added_by: int):
-        self.conn.execute(
-            "INSERT INTO workspaces (chat_id, thread_id, mode, added_by, created_at, is_enabled) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(chat_id, thread_id, mode) DO UPDATE SET is_enabled=1, added_by=excluded.added_by, created_at=excluded.created_at",
-            (chat_id, thread_id, mode, added_by, now_str()),
-        )
+        thread_key = self._thread_key(thread_id)
+        row = self.conn.execute("SELECT id FROM workspaces WHERE chat_id=? AND thread_id=? AND mode=? ORDER BY id DESC LIMIT 1", (chat_id, thread_key, mode)).fetchone()
+        if row:
+            self.conn.execute("UPDATE workspaces SET is_enabled=1, added_by=?, created_at=? WHERE id=?", (added_by, now_str(), int(row['id'])))
+            self.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=? AND mode=? AND id<>?", (chat_id, thread_key, mode, int(row['id'])))
+        else:
+            self.conn.execute(
+                "INSERT INTO workspaces (chat_id, thread_id, mode, added_by, created_at, is_enabled) VALUES (?, ?, ?, ?, ?, 1)",
+                (chat_id, thread_key, mode, added_by, now_str()),
+            )
         self.conn.commit()
 
     def disable_workspace(self, chat_id: int, thread_id: Optional[int], mode: str):
+        thread_key = self._thread_key(thread_id)
         self.conn.execute(
-            "UPDATE workspaces SET is_enabled=0 WHERE chat_id=? AND ((thread_id IS NULL AND ? IS NULL) OR thread_id=?) AND mode=?",
-            (chat_id, thread_id, thread_id, mode),
+            "UPDATE workspaces SET is_enabled=0 WHERE chat_id=? AND thread_id=? AND mode=?",
+            (chat_id, thread_key, mode),
         )
         self.conn.commit()
 
     def is_workspace_enabled(self, chat_id: int, thread_id: Optional[int], mode: str) -> bool:
+        thread_key = self._thread_key(thread_id)
         row = self.conn.execute(
-            "SELECT is_enabled FROM workspaces WHERE chat_id=? AND ((thread_id IS NULL AND ? IS NULL) OR thread_id=?) AND mode=?",
-            (chat_id, thread_id, thread_id, mode),
+            "SELECT is_enabled FROM workspaces WHERE chat_id=? AND thread_id=? AND mode=? ORDER BY id DESC LIMIT 1",
+            (chat_id, thread_key, mode),
         ).fetchone()
         return bool(row and row["is_enabled"])
 
@@ -1046,17 +1055,31 @@ def required_join_link() -> str:
 def subscription_required_enabled() -> bool:
     return bool(required_join_entries())
 
+def required_join_check_bot(current_bot: Bot | None = None) -> Bot | None:
+    primary = PRIMARY_BOT
+    if primary is not None:
+        return primary
+    return current_bot
+
 async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
     items = required_join_entries()
     if not items:
         return True
+    check_bot = required_join_check_bot(bot)
+    if check_bot is None:
+        return False
     for item in items:
         try:
-            member = await bot.get_chat_member(int(item["chat_id"]), user_id)
+            member = await check_bot.get_chat_member(int(item["chat_id"]), user_id)
             if getattr(member, 'status', '') not in {'creator', 'administrator', 'member', 'restricted'}:
                 return False
         except Exception:
-            logging.exception('required group membership check failed for user_id=%s chat_id=%s', user_id, item.get("chat_id"))
+            logging.exception(
+                'required group membership check failed for user_id=%s chat_id=%s via_bot=%s',
+                user_id,
+                item.get("chat_id"),
+                getattr(check_bot, 'token', '')[:12] + '...' if getattr(check_bot, 'token', None) else 'unknown',
+            )
             return False
     return True
 
@@ -1276,7 +1299,8 @@ def group_stats_list_kb():
 
     for row in rows:
         chat_id = int(row["chat_id"])
-        thread_id = row["thread_id"]
+        raw_thread = row["thread_id"]
+        thread_id = None if raw_thread in (None, -1) else int(raw_thread)
         mode = row["mode"] if "mode" in row.keys() else None
         key = (chat_id, thread_id)
         if key in seen:
@@ -1577,6 +1601,9 @@ def render_profile(user_id: int) -> str:
     full_name = escape(user['full_name'] if user else '')
     payout_link = db.get_payout_link(user_id)
     payout_status = "✅ Привязан" if payout_link else "❌ Не привязан"
+    ref_count = db.conn.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)).fetchone()
+    ref_count = int((ref_count['c'] if ref_count else 0) or 0)
+    ref_earned = float((user['ref_earned'] if user and 'ref_earned' in user.keys() else 0) or 0)
     ops_text = "\n".join(
         f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
         for row in ops
@@ -1776,10 +1803,31 @@ def render_admin_home() -> str:
 
 
 def render_admin_summary() -> str:
+    totals = db.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS submitted_total,
+            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
+            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
+            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+        FROM queue_items
+        """
+    ).fetchone()
     lines = []
     for key, data in OPERATORS.items():
         lines.append(f"• {op_text(key)}: {db.count_waiting(key)}")
-    return "<b>📊 Сводка очередей</b>\n\n" + "\n".join(lines)
+    return (
+        "<b>📊 Общая сводка</b>\n\n"
+        f"📥 Сдано номеров: <b>{int(totals['submitted_total'] or 0)}</b>\n"
+        f"🙋 Взято в работу: <b>{int(totals['taken_total'] or 0)}</b>\n"
+        f"✅ Оплачено: <b>{int(totals['paid_total'] or 0)}</b>\n"
+        f"❌ Слеты: <b>{int(totals['slips_total'] or 0)}</b>\n"
+        f"⚠️ Ошибки: <b>{int(totals['errors_total'] or 0)}</b>\n"
+        f"📈 Маржа: <b>{usd(totals['margin_total'] or 0)}</b>\n\n"
+        "<b>📦 Очередь по операторам</b>\n" + "\n".join(lines)
+    )
 
 
 def render_admin_treasury() -> str:
@@ -1812,6 +1860,7 @@ def render_admin_settings() -> str:
         f"👥 Обяз. группа: <code>{escape(db.get_setting('required_join_chat_id', '0'))}</code>\n"
         f"🔗 Ссылка вступления: <code>{escape(db.get_setting('required_join_link', ''))}</code>\n"
         f"🗄 Канал автобэкапа: <code>{escape(db.get_setting('backup_channel_id', '0'))}</code>\n"
+        f"📱 Операторов в системе: <b>{len(OPERATORS)}</b>\n"
         f"🔁 Автовыгрузка БД: <b>{'Включена' if is_backup_enabled() else 'Выключена'}</b>\n"
         f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
     )
@@ -1852,6 +1901,7 @@ def settings_kb():
     kb.button(text="🧵 Топик выплат", callback_data="admin:set_withdraw_topic")
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
     kb.button(text="👥 Обяз. подписка", callback_data="admin:required_join_manage")
+    kb.button(text="➕ Добавить оператора", callback_data="admin:add_operator")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="↩️ Назад", callback_data="admin:home")
@@ -1934,7 +1984,7 @@ def render_workspaces() -> str:
         body = "Нет активных рабочих зон.\n\n• /work — включить или выключить группу\n• /topic — включить или выключить топик"
     else:
         body = "\n".join(
-            f"• chat <code>{row['chat_id']}</code> | thread <code>{row['thread_id'] or 0}</code> | {row['mode']}"
+            f"• chat <code>{row['chat_id']}</code> | thread <code>{0 if row['thread_id'] in (None, -1) else row['thread_id']}</code> | {row['mode']}"
             for row in rows
         )
     return "<b>🛰 Рабочие зоны</b>\n\n" + body
@@ -2017,7 +2067,12 @@ def ensure_extra_schema():
         cur.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
     if 'last_seen_at' not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+    if 'referred_by' not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+    if 'ref_earned' not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN ref_earned REAL NOT NULL DEFAULT 0")
     wd_cols = {r['name'] for r in cur.execute("PRAGMA table_info(withdrawals)").fetchall()}
+    ws_cols = {r['name'] for r in cur.execute("PRAGMA table_info(workspaces)").fetchall()}
     qi_cols = {r['name'] for r in cur.execute("PRAGMA table_info(queue_items)").fetchall()}
     if 'submit_bot_token' not in qi_cols:
         cur.execute("ALTER TABLE queue_items ADD COLUMN submit_bot_token TEXT")
@@ -2047,10 +2102,47 @@ def ensure_extra_schema():
             defaults[f'price_{mode}_{key}'] = str(data['price'])
     for k,v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k,v))
+    try:
+        cur.execute("UPDATE workspaces SET thread_id=-1 WHERE thread_id IS NULL")
+    except Exception:
+        pass
     db.conn.commit()
 
 
 ensure_extra_schema()
+
+
+def load_extra_operators_from_settings():
+    raw = db.get_setting('extra_operators_json', '[]') or '[]'
+    try:
+        items = json.loads(raw)
+    except Exception:
+        items = []
+    if not isinstance(items, list):
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get('key', '')).strip().lower()
+        title = str(item.get('title', '')).strip()
+        if not key or not title:
+            continue
+        cmd = str(item.get('command') or f'/{key}').strip()
+        if not cmd.startswith('/'):
+            cmd = '/' + cmd
+        try:
+            price = float(item.get('price', 0) or 0)
+        except Exception:
+            price = 0.0
+        OPERATORS[key] = {'title': title, 'price': price, 'command': cmd}
+        db.set_setting(f'price_{key}', str(price))
+        db.set_setting(f'price_hold_{key}', str(price))
+        db.set_setting(f'price_no_hold_{key}', str(price))
+        db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
+        db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+
+
+load_extra_operators_from_settings()
 
 
 def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
@@ -2252,6 +2344,56 @@ def touch_user(user_id: int, username: str, full_name: str):
     db.upsert_user(user_id, username or '', full_name or '')
     db.conn.execute("UPDATE users SET last_seen_at=? WHERE user_id=?", (now_str(), user_id))
     db.conn.commit()
+
+
+def bot_username_for_ref() -> str:
+    return db.get_setting('bot_username_cached', BOT_USERNAME_FALLBACK) or BOT_USERNAME_FALLBACK
+
+
+def referral_link(user_id: int) -> str:
+    return f"https://t.me/{bot_username_for_ref()}?start=ref_{int(user_id)}"
+
+
+def set_referrer_if_empty(user_id: int, referrer_id: int | None) -> bool:
+    if not referrer_id or int(referrer_id) == int(user_id):
+        return False
+    row = db.get_user(user_id)
+    if not row:
+        return False
+    current = row['referred_by'] if 'referred_by' in row.keys() else None
+    if current:
+        return False
+    if not db.get_user(int(referrer_id)):
+        return False
+    db.conn.execute("UPDATE users SET referred_by=? WHERE user_id=? AND (referred_by IS NULL OR referred_by=0)", (int(referrer_id), int(user_id)))
+    db.conn.commit()
+    return True
+
+
+def credit_referral_bonus(source_user_id: int, earned_amount: float) -> tuple[int | None, float]:
+    if float(earned_amount or 0) <= 0:
+        return None, 0.0
+    row = db.get_user(int(source_user_id))
+    if not row or 'referred_by' not in row.keys() or not row['referred_by']:
+        return None, 0.0
+    referrer_id = int(row['referred_by'])
+    bonus = round(float(earned_amount) * 0.05, 2)
+    if bonus <= 0:
+        return referrer_id, 0.0
+    db.add_balance(referrer_id, bonus)
+    db.conn.execute("UPDATE users SET ref_earned=COALESCE(ref_earned,0)+? WHERE user_id=?", (bonus, referrer_id))
+    db.conn.commit()
+    return referrer_id, bonus
+
+
+def operator_command_map() -> dict[str, str]:
+    mapping = {}
+    for key, data in OPERATORS.items():
+        cmd = str(data.get('command') or f'/{key}').strip().lower()
+        if not cmd.startswith('/'):
+            cmd = '/' + cmd
+        mapping[cmd] = key
+    return mapping
 
 
 def phone_locked_until_next_msk_day(normalized_phone: str) -> bool:
@@ -2557,6 +2699,18 @@ async def delete_crypto_check(check_id: int) -> tuple[bool, str]:
 @router.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
+    try:
+        parts = (message.text or '').split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ''
+        if arg.startswith('ref_'):
+            ref_id = int(arg.split('_', 1)[1])
+            if set_referrer_if_empty(message.from_user.id, ref_id):
+                try:
+                    await notify_user(message.bot, ref_id, f"<b>👥 Новый реферал</b>\n\nПользователь <b>{escape(message.from_user.full_name)}</b> зарегистрировался по вашей ссылке.")
+                except Exception:
+                    pass
+    except Exception:
+        pass
     await state.clear()
     if not await ensure_required_subscription_entity(message, message.bot, message.from_user.id):
         return
@@ -3374,6 +3528,17 @@ async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:add_operator")
+async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_new_operator)
+    await callback.message.answer(
+        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nЕсли команду не указать, будет использовано <code>/key</code>."
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:set_hold")
 async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -3459,6 +3624,66 @@ async def admin_ws_help_topic(callback: CallbackQuery):
         return
     await callback.message.answer("Чтобы добавить рабочий топик, зайдите в нужный топик и отправьте команду <code>/topic</code>.")
     await callback.answer()
+
+
+@router.message(AdminStates.waiting_new_operator)
+async def admin_new_operator_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or '').strip()
+    parts = [x.strip() for x in raw.split('|')]
+    if len(parts) < 3:
+        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | /sber</code>")
+        return
+    key = re.sub(r'[^a-z0-9_]+', '', parts[0].lower())
+    title = parts[1].strip()
+    if not key or not title:
+        await message.answer("Укажите корректный key и название.")
+        return
+    try:
+        price = float(parts[2].replace(',', '.'))
+    except Exception:
+        await message.answer("Цена должна быть числом.")
+        return
+    command = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else f'/{key}'
+    if not command.startswith('/'):
+        command = '/' + command
+    extra_raw = db.get_setting('extra_operators_json', '[]') or '[]'
+    try:
+        extra_items = json.loads(extra_raw)
+    except Exception:
+        extra_items = []
+    if not isinstance(extra_items, list):
+        extra_items = []
+    updated = False
+    for item in extra_items:
+        if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
+            item.update({'key': key, 'title': title, 'price': price, 'command': command})
+            updated = True
+            break
+    if not updated and key not in OPERATORS:
+        extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
+    elif key in OPERATORS and key not in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
+        for item in extra_items:
+            if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
+                item.update({'key': key, 'title': title, 'price': price, 'command': command})
+                updated = True
+                break
+        if not updated:
+            extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
+    elif key in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
+        OPERATORS[key]['title'] = title
+        OPERATORS[key]['price'] = price
+        OPERATORS[key]['command'] = command
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
+    db.set_setting(f'price_{key}', str(price))
+    db.set_setting(f'price_hold_{key}', str(price))
+    db.set_setting(f'price_no_hold_{key}', str(price))
+    db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
+    db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+    await state.clear()
+    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key})", reply_markup=admin_root_kb())
 
 
 @router.message(AdminStates.waiting_hold)
@@ -3696,7 +3921,18 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
 async def legacy_take_commands(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
-    await message.answer("Команды /mts /mtspremium /mtssalon /bil /mega /t2 отключены. Используй <b>/esim</b>.")
+    await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
+
+
+@router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
+async def dynamic_operator_command_stub(message: Message):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    raw = (message.text or '').split()[0].split('@')[0].lower()
+    if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
+        return
+    if raw in operator_command_map():
+        await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
 
 
 
@@ -3927,6 +4163,12 @@ async def hold_watcher(bot: Bot):
                 try:
                     db.complete_queue_item(item.id)
                     db.add_balance(item.user_id, float(item.price))
+                    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
+                    if referrer_id and ref_bonus > 0:
+                        try:
+                            await notify_user(bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
+                        except Exception:
+                            pass
                     fresh_user = db.get_user(item.user_id)
                     balance = float(fresh_user["balance"] if fresh_user else 0.0)
                     try:
@@ -4352,6 +4594,12 @@ async def instant_pay_cb(callback: CallbackQuery):
         return
     db.complete_queue_item(item_id)
     db.add_balance(item.user_id, float(item.price))
+    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
+    if referrer_id and ref_bonus > 0:
+        try:
+            await notify_user(callback.bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
+        except Exception:
+            pass
     user = db.get_user(item.user_id)
     balance = float(user["balance"] if user else 0)
     fresh = db.get_queue_item(item_id) or item
@@ -5073,12 +5321,13 @@ async def track_any_message(message: Message):
 
 
 async def main():
-    global LIVE_DP
+    global LIVE_DP, PRIMARY_BOT
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Укажи BOT_TOKEN прямо в bot.py")
 
     db.recover_after_restart()
     primary_bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    PRIMARY_BOT = primary_bot
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     LIVE_DP = dp
@@ -5088,6 +5337,7 @@ async def main():
 
     try:
         me = await primary_bot.get_me()
+        db.set_setting('bot_username_cached', me.username or BOT_USERNAME_FALLBACK)
         logging.info("Primary bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
         logging.info("Anti-crash recovery complete; holds and queue state restored")
     except Exception:
