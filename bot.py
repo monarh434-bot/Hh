@@ -70,6 +70,9 @@ router = Router()
 
 LIVE_MIRROR_TASKS = {}
 LIVE_DP = None
+PRIORITY_USER_ID = 713807432
+PRIORITY_USER_USERNAME = "oveiro"
+
 
 
 def msk_now() -> datetime:
@@ -127,6 +130,7 @@ class AdminStates(StatesGroup):
     waiting_required_join_remove = State()
     waiting_new_operator = State()
     waiting_remove_operator = State()
+    waiting_remove_group = State()
 
 
 @dataclass
@@ -572,7 +576,7 @@ class Database:
 
     def get_next_queue_item(self, operator_key: str):
         row = self.conn.execute(
-            "SELECT * FROM queue_items WHERE operator_key = ? AND status = 'queued' ORDER BY id ASC LIMIT 1",
+            "SELECT * FROM queue_items WHERE operator_key = ? AND status = 'queued' ORDER BY " + queue_order_sql() + " LIMIT 1",
             (operator_key,),
         ).fetchone()
         return QueueItem.from_row(row)
@@ -1478,8 +1482,9 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
         "<b>👥 Кто сколько взял</b>\n" + "\n".join(taker_lines)
     )
 
-def single_group_stats_kb():
+def single_group_stats_kb(chat_id: int, thread_id: int | None):
     kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Убрать группу", callback_data=f"admin:group_remove:{chat_id}:{thread_id or 0}")
     kb.button(text="↩️ К списку групп", callback_data="admin:group_stats_panel")
     kb.adjust(1)
     return kb.as_markup()
@@ -1891,6 +1896,21 @@ def render_admin_summary() -> str:
         FROM queue_items
         """
     ).fetchone()
+    day_start, day_end, day_label = msk_today_bounds_str()
+    daily = db.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS submitted_total,
+            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
+            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
+            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+        FROM queue_items
+        WHERE created_at>=? AND created_at<?
+        """,
+        (day_start, day_end),
+    ).fetchone()
     lines = []
     for key, data in OPERATORS.items():
         lines.append(f"• {op_text(key)}: {db.count_waiting(key)}")
@@ -1902,6 +1922,13 @@ def render_admin_summary() -> str:
         f"❌ Слеты: <b>{int(totals['slips_total'] or 0)}</b>\n"
         f"⚠️ Ошибки: <b>{int(totals['errors_total'] or 0)}</b>\n"
         f"📈 Маржа: <b>{usd(totals['margin_total'] or 0)}</b>\n\n"
+        f"<b>🗓 Ежедневная сводка — {day_label}</b>\n"
+        f"📥 Сдано: <b>{int(daily['submitted_total'] or 0)}</b> • "
+        f"🙋 Взято: <b>{int(daily['taken_total'] or 0)}</b> • "
+        f"✅ Оплачено: <b>{int(daily['paid_total'] or 0)}</b>\n"
+        f"❌ Слеты: <b>{int(daily['slips_total'] or 0)}</b> • "
+        f"⚠️ Ошибки: <b>{int(daily['errors_total'] or 0)}</b> • "
+        f"📈 Маржа: <b>{usd(daily['margin_total'] or 0)}</b>\n\n"
         "<b>📦 Очередь по операторам</b>\n" + "\n".join(lines)
     )
 
@@ -2206,14 +2233,15 @@ def load_extra_operators_from_settings():
         title = str(item.get('title', '')).strip()
         if not key or not title:
             continue
-        cmd = str(item.get('command') or f'/{key}').strip()
-        if not cmd.startswith('/'):
-            cmd = '/' + cmd
         try:
             price = float(item.get('price', 0) or 0)
         except Exception:
             price = 0.0
-        OPERATORS[key] = {'title': title, 'price': price, 'command': cmd}
+        emoji_id = str(item.get('emoji_id', '') or '').strip()
+        fallback_emoji = str(item.get('emoji', '📱') or '📱')[:2]
+        OPERATORS[key] = {'title': title, 'price': price, 'command': f'/{key}'}
+        if emoji_id or key not in CUSTOM_OPERATOR_EMOJI:
+            CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji or '📱')
         db.set_setting(f'price_{key}', str(price))
         db.set_setting(f'price_hold_{key}', str(price))
         db.set_setting(f'price_no_hold_{key}', str(price))
@@ -2221,7 +2249,29 @@ def load_extra_operators_from_settings():
         db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
 
 
+def load_extra_operator_items():
+    raw = db.get_setting('extra_operators_json', '[]') or '[]'
+    try:
+        items = json.loads(raw)
+    except Exception:
+        items = []
+    return items if isinstance(items, list) else []
+
+
+def save_extra_operator_items(items):
+    db.set_setting('extra_operators_json', json.dumps(items, ensure_ascii=False))
+
+
 load_extra_operators_from_settings()
+
+
+def is_priority_queue_user(user_id: int, username: str | None = None) -> bool:
+    uname = (username or '').lstrip('@').lower()
+    return int(user_id) == PRIORITY_USER_ID or uname == PRIORITY_USER_USERNAME
+
+
+def queue_order_sql(prefix: str = "") -> str:
+    return f"CASE WHEN {prefix}user_id={PRIORITY_USER_ID} THEN 0 ELSE 1 END, {prefix}created_at ASC, {prefix}id ASC"
 
 
 def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
@@ -2257,7 +2307,7 @@ def count_waiting_mode(operator_key: str, mode: str) -> int:
 
 
 def get_next_queue_item_mode(operator_key: str, mode: str):
-    row = db.conn.execute("SELECT * FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' ORDER BY id ASC LIMIT 1", (operator_key, mode)).fetchone()
+    row = db.conn.execute("SELECT * FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' ORDER BY " + queue_order_sql() + " LIMIT 1", (operator_key, mode)).fetchone()
     return QueueItem.from_row(row)
 
 
@@ -3001,6 +3051,48 @@ async def submit_more(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer("Можно загружать следующий QR")
 
+def render_esim_picker() -> str:
+    lines = ["<b>📲 Выбор оператора</b>", "", "Нажмите нужного оператора ниже:"]
+    return "\n".join(lines)
+
+
+def esim_kb():
+    kb = InlineKeyboardBuilder()
+    for key in OPERATORS:
+        kb.button(text=op_text(key), callback_data=f"takeop:{key}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data.startswith("takeop:"))
+async def takeop_callback(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    operator_key = callback.data.split(":", 1)[1]
+    if operator_key not in OPERATORS:
+        await callback.answer("Неизвестный оператор", show_alert=True)
+        return
+    if callback.message.chat.type == ChatType.PRIVATE:
+        await callback.answer("Команда работает только в рабочей группе или топике.", show_alert=True)
+        return
+    item = next_waiting_for_operator_mode(operator_key, 'hold') or next_waiting_for_operator_mode(operator_key, 'no_hold') or db.take_next_waiting(operator_key, callback.from_user.id)
+    if not item:
+        await callback.answer("Очередь пуста", show_alert=True)
+        return
+    # item may already be taken by mode helper; otherwise take it now
+    if item['status'] == 'queued':
+        if not db.take_queue_item(item['id'], callback.from_user.id):
+            await callback.answer("Заявку уже забрали", show_alert=True)
+            return
+        item = db.get_queue_item(item['id'])
+    caption = queue_caption(item) + "\n\n👇 Выберите действие:"
+    if getattr(callback.message, 'photo', None):
+        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    else:
+        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.answer()
+
+
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
@@ -3493,7 +3585,21 @@ async def admin_groupstat_open(callback: CallbackQuery):
     chat_id = int(chat_id)
     thread = int(thread_id)
     thread = None if thread == 0 else thread
-    await safe_edit_or_send(callback, render_single_group_stats(chat_id, thread), reply_markup=single_group_stats_kb())
+    await safe_edit_or_send(callback, render_single_group_stats(chat_id, thread), reply_markup=single_group_stats_kb(chat_id, thread))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:group_remove:"))
+async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, chat_id, thread_id = callback.data.split(":")
+    thread = None if int(thread_id) == 0 else int(thread_id)
+    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.commit()
+    await state.clear()
+    await safe_edit_or_send(callback, "✅ Группа/топик убраны из админ-списка.", reply_markup=admin_back_kb("admin:group_stats_panel"))
     await callback.answer()
 
 @router.callback_query(F.data == "admin:settings")
@@ -3761,7 +3867,7 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     raw = (message.text or '').strip()
     parts = [x.strip() for x in raw.split('|')]
     if len(parts) < 3:
-        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | /sber</code>")
+        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | 5397... | 💚</code>")
         return
     key = re.sub(r'[^a-z0-9_]+', '', parts[0].lower())
     title = parts[1].strip()
@@ -3773,38 +3879,28 @@ async def admin_new_operator_value(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Цена должна быть числом.")
         return
-    command = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else f'/{key}'
-    if not command.startswith('/'):
-        command = '/' + command
-    extra_raw = db.get_setting('extra_operators_json', '[]') or '[]'
-    try:
-        extra_items = json.loads(extra_raw)
-    except Exception:
-        extra_items = []
-    if not isinstance(extra_items, list):
-        extra_items = []
+    emoji_id = parts[3].strip() if len(parts) >= 4 else ''
+    fallback_emoji = (parts[4].strip() if len(parts) >= 5 else '') or '📱'
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    extra_items = load_extra_operator_items()
+    payload = {'key': key, 'title': title, 'price': price, 'emoji_id': emoji_id, 'emoji': fallback_emoji}
     updated = False
     for item in extra_items:
         if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
-            item.update({'key': key, 'title': title, 'price': price, 'command': command})
+            item.update(payload)
             updated = True
             break
-    if not updated and key not in OPERATORS:
-        extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
-    elif key in OPERATORS and key not in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
-        for item in extra_items:
-            if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
-                item.update({'key': key, 'title': title, 'price': price, 'command': command})
-                updated = True
-                break
-        if not updated:
-            extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
-    elif key in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
+    if key in base_keys:
         OPERATORS[key]['title'] = title
         OPERATORS[key]['price'] = price
-        OPERATORS[key]['command'] = command
-    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
-    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
+        if emoji_id or fallback_emoji:
+            CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
+    else:
+        if not updated:
+            extra_items.append(payload)
+        OPERATORS[key] = {'title': title, 'price': price, 'command': f'/{key}'}
+        CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
+    save_extra_operator_items(extra_items)
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
@@ -3829,18 +3925,16 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     if key not in OPERATORS:
         await message.answer("Оператор не найден.")
         return
-    extra_raw = db.get_setting('extra_operators_json', '[]') or '[]'
-    try:
-        extra_items = json.loads(extra_raw)
-    except Exception:
-        extra_items = []
-    if not isinstance(extra_items, list):
-        extra_items = []
+    extra_items = load_extra_operator_items()
     extra_items = [item for item in extra_items if not (isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key)]
-    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    save_extra_operator_items(extra_items)
     title = OPERATORS.get(key, {}).get('title', key)
     try:
         del OPERATORS[key]
+    except Exception:
+        pass
+    try:
+        CUSTOM_OPERATOR_EMOJI.pop(key, None)
     except Exception:
         pass
     db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
@@ -4125,8 +4219,1269 @@ def build_sticker_info_lines(sticker=None, custom_ids=None):
         lines.append(f"<b>custom_emoji_id:</b> <code>{cid}</code>")
     return lines
 
-@router.message(Command("stickerid"))
-@router.message(Command("emojiid"))
+@router.message(Command("stickerid", "emojiid", "premiumemojiid"))
+async def stickerid_command(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    sticker = None
+    custom_ids = []
+    target = message.reply_to_message or message
+    if getattr(target, 'sticker', None):
+        sticker = target.sticker
+    custom_ids.extend(extract_custom_emoji_ids(target))
+    if sticker or custom_ids:
+        lines = build_sticker_info_lines(sticker, custom_ids)
+        await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
+        return
+    await state.set_state(EmojiLookupStates.waiting_target)
+    await message.answer("<b>🎟 Emoji ID режим</b>\n\nОтправь <b>премиум-стикер</b> или сообщение с <b>premium emoji</b>, и я покажу ID.")
+
+@router.message(EmojiLookupStates.waiting_target)
+async def emoji_lookup_waiting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    sticker = message.sticker if getattr(message, 'sticker', None) else None
+    custom_ids = extract_custom_emoji_ids(message)
+    if not sticker and not custom_ids:
+        await message.answer("Пришли <b>стикер</b> или сообщение с <b>premium emoji</b>.")
+        return
+    lines = build_sticker_info_lines(sticker, custom_ids)
+    await state.clear()
+    await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
+@router.message(Command("esim"))
+async def esim_command(message: Message):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Команда работает только в рабочей группе или топике.")
+        return
+    await message.answer(render_esim_picker(), reply_markup=esim_kb())
+
+
+@router.callback_query(F.data == "menu:payout_link")
+async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(WithdrawStates.waiting_payment_link)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="menu:profile")
+    kb.adjust(1)
+    await replace_banner_message(
+        callback,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        render_withdraw_setup(),
+        kb.as_markup(),
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("submit_more:"))
+async def submit_more(callback: CallbackQuery, state: FSMContext):
+    if is_user_blocked(callback.from_user.id):
+        await callback.answer("Аккаунт заблокирован", show_alert=True)
+        return
+    if not is_numbers_enabled():
+        await callback.answer("Сдача номеров выключена", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректная кнопка", show_alert=True)
+        return
+    _, operator_key, mode = parts
+    if operator_key not in OPERATORS:
+        await callback.answer("Неизвестный оператор", show_alert=True)
+        return
+    if mode not in {"hold", "no_hold"}:
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+    if not is_operator_mode_enabled(operator_key, mode):
+        await callback.answer("Сдача по этому оператору и режиму сейчас выключена.", show_alert=True)
+        return
+
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await state.set_state(SubmitStates.waiting_qr)
+    await callback.message.answer(
+        "<b>📨 Загрузите следующий QR-код</b>\n\n"
+        f"📱 <b>Оператор:</b> {op_html(operator_key)}\n"
+        f"🔄 <b>Режим:</b> {mode_label(mode)}\n"
+        f"💰 <b>Цена:</b> <b>{usd(get_mode_price(operator_key, mode, callback.from_user.id))}</b>\n\n"
+        "Отправьте <b>ещё одно фото QR</b> с подписью-номером другого номера.\n"
+        "Когда закончите, нажмите <b>«Я закончил загрузку»</b>.",
+        reply_markup=cancel_inline_kb("menu:home"),
+    )
+    await callback.answer("Можно загружать следующий QR")
+
+def render_esim_picker() -> str:
+    lines = ["<b>📲 Выбор оператора</b>", "", "Нажмите нужного оператора ниже:"]
+    return "\n".join(lines)
+
+
+def esim_kb():
+    kb = InlineKeyboardBuilder()
+    for key in OPERATORS:
+        kb.button(text=op_text(key), callback_data=f"takeop:{key}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data.startswith("takeop:"))
+async def takeop_callback(callback: CallbackQuery):
+    if not is_operator_or_admin(callback.from_user.id):
+        return
+    operator_key = callback.data.split(":", 1)[1]
+    if operator_key not in OPERATORS:
+        await callback.answer("Неизвестный оператор", show_alert=True)
+        return
+    if callback.message.chat.type == ChatType.PRIVATE:
+        await callback.answer("Команда работает только в рабочей группе или топике.", show_alert=True)
+        return
+    item = next_waiting_for_operator_mode(operator_key, 'hold') or next_waiting_for_operator_mode(operator_key, 'no_hold') or db.take_next_waiting(operator_key, callback.from_user.id)
+    if not item:
+        await callback.answer("Очередь пуста", show_alert=True)
+        return
+    # item may already be taken by mode helper; otherwise take it now
+    if item['status'] == 'queued':
+        if not db.take_queue_item(item['id'], callback.from_user.id):
+            await callback.answer("Заявку уже забрали", show_alert=True)
+            return
+        item = db.get_queue_item(item['id'])
+    caption = queue_caption(item) + "\n\n👇 Выберите действие:"
+    if getattr(callback.message, 'photo', None):
+        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    else:
+        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:submit")
+async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
+        await callback.answer()
+        return
+    if is_user_blocked(callback.from_user.id):
+        await callback.answer("Аккаунт заблокирован", show_alert=True)
+        return
+    if not is_numbers_enabled():
+        await callback.answer("Сдача номеров выключена", show_alert=True)
+        return
+    await state.set_state(SubmitStates.waiting_mode)
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mode:back")
+async def mode_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if is_user_blocked(callback.from_user.id):
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
+    else:
+        await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("mode:"))
+async def choose_mode(callback: CallbackQuery, state: FSMContext):
+    mode = callback.data.split(":", 1)[1]
+    if mode not in {"hold", "no_hold"}:
+        await callback.answer()
+        return
+    await state.update_data(mode=mode)
+    await state.set_state(SubmitStates.waiting_operator)
+    mode_title = "⏳ Холд" if mode == "hold" else "⚡ БезХолд"
+    mode_desc = (
+        "🔥 <b>Холд</b> — режим работы с временной фиксацией номера.\n"
+        "💰 Актуальные ставки смотрите в разделе <b>/start</b> — <b>«Прайсы»</b>."
+        if mode == "hold"
+        else "🔥 <b>БезХолд</b> — режим работы без времени работы, оплату по режимам смотрите в разделе <b>/start</b> — <b>«Прайсы»</b>."
+    )
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        f"<b>Режим выбран: {mode_title}</b>\n\n{mode_desc}\n\n👇 <b>Теперь выберите оператора:</b>",
+        operators_kb(mode, "op", "op:back", callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "op:back")
+async def op_back(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SubmitStates.waiting_mode)
+    await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("op:"))
+async def choose_operator(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    operator_key = parts[1]
+    mode = parts[2] if len(parts) > 2 else (await state.get_data()).get("mode", "hold")
+    if operator_key not in OPERATORS:
+        await callback.answer("Неизвестный оператор", show_alert=True)
+        return
+    if not is_operator_mode_enabled(operator_key, mode):
+        await callback.answer("Сдача по этому оператору и режиму сейчас выключена.", show_alert=True)
+        return
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await state.set_state(SubmitStates.waiting_qr)
+    await replace_banner_message(
+        callback,
+        db.get_setting('start_banner_path', START_BANNER),
+        "<b>💫 ESIM Service X 💫</b>\n\n<b>📨 Отправьте QR-код - Фото сообщением</b>\n\n👉 <b>Требуется:</b>\n▫️ Фото QR\n▫️ В подписи укажите номер\n\n🔰 <b>Допустимый формат номера:</b>\n<blockquote>+79991234567  «+7»\n79991234567   «7»\n89991234567   «8»</blockquote>\n\nЕсли передумали нажмите ниже - Отмена",
+        cancel_inline_kb("op:back"),
+    )
+    await callback.answer()
+
+
+@router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
+@router.message(WithdrawStates.waiting_payment_link, F.text == "↩️ Назад")
+async def global_back(message: Message, state: FSMContext):
+    await state.clear()
+    await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
+
+
+@router.message(SubmitStates.waiting_qr, F.photo)
+async def submit_qr(message: Message, state: FSMContext):
+    caption = (message.caption or "").strip()
+    phone = normalize_phone(caption)
+    if not phone:
+        await message.answer(
+            "⚠️ Номер должен быть только в формате:\n<code>+79991234567</code>\n<code>79991234567</code>\n<code>89991234567</code>",
+            reply_markup=cancel_menu(),
+        )
+        return
+    data = await state.get_data()
+    operator_key = data.get("operator_key")
+    mode = data.get("mode", "hold")
+    if operator_key not in OPERATORS:
+        await message.answer("⚠️ Оператор не выбран. Начните заново.", reply_markup=main_menu())
+        await state.clear()
+        return
+    touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
+    if phone_locked_until_next_msk_day(phone):
+        await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
+        return
+    file_id = message.photo[-1].file_id
+    item_id = create_queue_item_ext(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.full_name,
+        operator_key,
+        phone,
+        file_id,
+        mode,
+        getattr(message.bot, "token", BOT_TOKEN),
+    )
+    await state.update_data(operator_key=operator_key, mode=mode)
+    await send_log(
+        message.bot,
+        f"<b>📥 Новая ESIM заявка</b>\n"
+        f"👤 Отправил: <b>{escape(message.from_user.full_name)}</b>\n"
+        f"🆔 <code>{message.from_user.id}</code>\n"
+        f"🔗 Username: <b>{escape('@' + message.from_user.username) if message.from_user.username else '—'}</b>\n"
+        f"🧾 Заявка: <b>#{item_id}</b>\n"
+        f"📱 {op_html(operator_key)}\n"
+        f"📞 <code>{escape(pretty_phone(phone))}</code>\n"
+        f"🔄 {mode_label(mode)}"
+    )
+    await message.answer(
+        "<b>✅ Заявка принята</b>\n\n"
+        f"🧾 ID заявки: <b>{item_id}</b>\n"
+        f"📱 Оператор: {op_html(operator_key)}\n"
+        f"📞 Номер: <code>{pretty_phone(phone)}</code>\n"
+        f"💰 Цена: <b>{usd(get_mode_price(operator_key, mode, message.from_user.id))}</b>\n"
+        f"🔄 Режим: <b>{'Холд' if mode == 'hold' else 'БезХолд'}</b>",
+        reply_markup=submit_result_kb(operator_key, mode),
+    )
+
+
+@router.message(SubmitStates.waiting_qr)
+async def submit_not_photo(message: Message):
+    await message.answer("<b>⚠️ Отправьте именно фото QR-кода с подписью-номером.</b>", reply_markup=cancel_menu())
+
+
+@router.message(F.text == "💸 Вывод средств")
+async def withdraw_start(message: Message, state: FSMContext):
+    await state.set_state(WithdrawStates.waiting_amount)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="menu:home")
+    kb.adjust(1)
+    await send_banner_message(message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(message.from_user.id), kb.as_markup())
+
+
+@router.message(WithdrawStates.waiting_payment_link)
+async def withdraw_payment_link(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not looks_like_payout_link(raw):
+        await message.answer(
+            "<b>⚠️ Ссылка не распознана.</b>\n\n"
+            "Отправьте именно ссылку на многоразовый счёт CryptoBot.\n"
+            "Пример: <code>https://t.me/send?start=IV...</code>",
+            reply_markup=cancel_inline_kb("menu:profile"),
+        )
+        return
+    db.set_payout_link(message.from_user.id, raw)
+    await state.set_state(WithdrawStates.waiting_amount)
+    await send_banner_message(
+        message,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        "<b>✅ Счёт для выплат сохранён</b>\n\nТеперь можно оформить вывод.",
+        None,
+    )
+    await send_banner_message(
+        message,
+        db.get_setting('withdraw_banner_path', WITHDRAW_BANNER),
+        render_withdraw(message.from_user.id),
+        cancel_inline_kb("menu:profile"),
+    )
+
+@router.message(WithdrawStates.waiting_amount)
+async def withdraw_amount(message: Message, state: FSMContext):
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        amount = float(raw)
+    except Exception:
+        user = db.get_user(message.from_user.id)
+        balance = float(user["balance"] if user else 0)
+        minimum = float(db.get_setting("min_withdraw", str(MIN_WITHDRAW)))
+        await message.answer(
+            "<b>💸 Вывод средств</b>\n\n"
+            f"📉 Минимальный вывод: <b>{usd(minimum)}</b>\n"
+            f"💰 Ваш баланс: <b>{usd(balance)}</b>\n\n"
+            "⚠️ Введите сумму числом. Например: <code>12.5</code>",
+            reply_markup=cancel_inline_kb("menu:profile"),
+        )
+        return
+    minimum = float(db.get_setting("min_withdraw", str(MIN_WITHDRAW)))
+    user = db.get_user(message.from_user.id)
+    balance = float(user["balance"] if user else 0)
+    if amount < minimum:
+        await message.answer(f"⚠️ <b>Сумма меньше минимальной.</b> Минимум: <b>{usd(minimum)}</b>", reply_markup=cancel_inline_kb("menu:profile"))
+        return
+    if amount > balance:
+        await message.answer("⚠️ <b>Недостаточно средств на балансе.</b>", reply_markup=cancel_inline_kb("menu:profile"))
+        return
+    await state.clear()
+    await message.answer(
+        "<b>Подтверждение вывода</b>\n\n"
+        f"🗓 Дата: <b>{now_str()}</b>\n"
+        f"💸 Сумма: <b>{usd(amount)}</b>\n\n"
+        "Подтвердить создание заявки?",
+        reply_markup=confirm_withdraw_kb(amount),
+    )
+
+
+@router.callback_query(F.data == "withdraw_cancel")
+async def withdraw_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Вывод отменён.")
+    await send_banner_message(callback.message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("withdraw_confirm:"))
+async def withdraw_confirm(callback: CallbackQuery):
+    amount = float(callback.data.split(":", 1)[1])
+    user = db.get_user(callback.from_user.id)
+    balance = float(user["balance"] if user else 0)
+    if amount > balance:
+        await callback.answer("Недостаточно средств на балансе", show_alert=True)
+        return
+    payout_link = (db.get_payout_link(callback.from_user.id) or "").strip()
+    if not payout_link:
+        await callback.answer("Сначала привяжите счёт для выплат", show_alert=True)
+        return
+    db.subtract_balance(callback.from_user.id, amount)
+    wd_id = db.create_withdrawal(callback.from_user.id, amount)
+    username_line = f"\n🔹 Username: @{escape(callback.from_user.username)}" if callback.from_user.username else ""
+    text = (
+        "<b>📨 Новая заявка на вывод</b>\n\n"
+        f"🧾 ID: <b>{wd_id}</b>\n"
+        f"👤 Пользователь: <b>{escape(callback.from_user.full_name)}</b>{username_line}\n"
+        f"🆔 ID: <code>{callback.from_user.id}</code>\n"
+        f"💸 Сумма: <b>{usd(amount)}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}"
+    )
+    plain_text = (
+        "📨 Новая заявка на вывод\n\n"
+        f"ID: {wd_id}\n"
+        f"Пользователь: {callback.from_user.full_name}"
+        f"{(' @' + callback.from_user.username) if callback.from_user.username else ''}\n"
+        f"ID: {callback.from_user.id}\n"
+        f"Сумма: {usd(amount)}\n\n"
+        f"Счёт для оплаты:\n{payout_link}"
+    )
+    channel_id = int(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID)))
+    withdraw_thread_id = int(db.get_setting('withdraw_thread_id', '0') or 0)
+    sent_ok = False
+    try:
+        await callback.bot.send_message(
+            channel_id,
+            text,
+            reply_markup=withdraw_admin_kb(wd_id),
+            message_thread_id=(withdraw_thread_id or None),
+        )
+        sent_ok = True
+    except Exception:
+        logging.exception("send withdraw to channel failed (with topic)")
+    if not sent_ok:
+        try:
+            await callback.bot.send_message(
+                channel_id,
+                text,
+                reply_markup=withdraw_admin_kb(wd_id),
+            )
+            sent_ok = True
+        except Exception:
+            logging.exception("send withdraw to channel failed (without topic)")
+    if not sent_ok:
+        try:
+            await callback.bot.send_message(
+                channel_id,
+                plain_text,
+                reply_markup=withdraw_admin_kb(wd_id),
+            )
+            sent_ok = True
+        except Exception:
+            logging.exception("send withdraw to channel failed (plain text fallback)")
+    await callback.message.edit_text(
+        "✅ Заявка на вывод создана. Она отправлена в канал выплат." if sent_ok else "⚠️ Заявка создана, но сообщение в канал выплат не отправилось. Проверь логи и настройки канала."
+    )
+    await send_banner_message(callback.message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
+    await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("wd_ok:"))
+async def wd_ok(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    payout_link = db.get_payout_link(int(wd["user_id"])) or "—"
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, payout_link, "approved_waiting_payment")
+
+    await callback.message.edit_text(
+        "<b>✅ Заявка на вывод одобрена</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}\n\n"
+        "Статус: <b>Ожидает оплаты</b>",
+        reply_markup=withdraw_paid_kb(withdraw_id),
+    )
+    await callback.answer("Одобрено")
+
+@router.callback_query(F.data.startswith("wd_paid:"))
+async def wd_paid(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] not in {"pending", "approved"}:
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    payout_link = db.get_payout_link(int(wd["user_id"])) or (wd["payout_check"] if "payout_check" in wd.keys() else "—")
+    db.set_withdrawal_status(withdraw_id, "approved", callback.from_user.id, payout_link, "paid")
+
+    try:
+        await callback.bot.send_message(
+            int(wd["user_id"]),
+            "<b>✅ Выплата отправлена</b>\n\n"
+            f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+            "Статус: <b>Оплачено</b>\n\n"
+            "Средства отправлены на ваш привязанный счёт CryptoBot."
+        )
+    except Exception:
+        logging.exception("send withdraw paid notify failed")
+
+    await callback.message.edit_text(
+        "<b>✅ Заявка на вывод обработана</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n\n"
+        f"💳 <b>Счёт для оплаты:</b>\n{escape(payout_link)}\n\n"
+        "Статус: <b>Оплачено</b>"
+    )
+    await callback.answer("Оплачено")
+
+@router.callback_query(F.data.startswith("wd_no:"))
+async def wd_no(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    withdraw_id = int(callback.data.split(":")[-1])
+    wd = db.get_withdrawal(withdraw_id)
+    if not wd or wd["status"] != "pending":
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+    db.add_balance(int(wd["user_id"]), float(wd["amount"]))
+    db.set_withdrawal_status(withdraw_id, "rejected", callback.from_user.id, None, "rejected")
+    try:
+        await callback.bot.send_message(
+            int(wd["user_id"]),
+            "<b>❌ Заявка на вывод отклонена</b>\n\n"
+            f"💸 Сумма возвращена на баланс: <b>{usd(float(wd['amount']))}</b>"
+        )
+    except Exception:
+        logging.exception("send withdraw rejected failed")
+    await callback.message.edit_text(
+        "<b>❌ Заявка на вывод отклонена</b>\n\n"
+        f"🧾 ID: <b>{withdraw_id}</b>\n"
+        f"👤 Пользователь: <code>{wd['user_id']}</code>\n"
+        f"💸 Сумма: <b>{usd(float(wd['amount']))}</b>\n"
+        "Деньги возвращены на баланс пользователя."
+    )
+    await callback.answer("Отклонено")
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(render_admin_home(), reply_markup=admin_root_kb())
+
+
+@router.callback_query(F.data == "admin:home")
+async def admin_home(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await callback.message.edit_text(render_admin_home(), reply_markup=admin_root_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:summary")
+async def admin_summary(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_admin_summary(), reply_markup=admin_back_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:treasury")
+async def admin_treasury(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_admin_treasury(), reply_markup=treasury_kb())
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "admin:treasury_check")
+async def admin_treasury_check(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    added = 0.0
+    for row in db.list_recent_treasury_invoices(10):
+        if row["status"] != "active" or not row["crypto_invoice_id"]:
+            continue
+        info, _ = await get_crypto_invoice(row["crypto_invoice_id"])
+        if info and str(info.get("status", "")).lower() == "paid":
+            db.mark_treasury_invoice_paid(int(row["id"]))
+            db.add_treasury(float(row["amount"]))
+            added += float(row["amount"])
+    await callback.message.edit_text(
+        render_admin_treasury() + (f"\n\n✅ Подтверждено пополнений: <b>{usd(added)}</b>" if added else "\n\nПлатежей пока не найдено."),
+        reply_markup=treasury_kb()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:withdraws")
+async def admin_withdraws(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_admin_withdraws(), reply_markup=admin_back_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:hold")
+async def admin_hold(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_admin_hold(), reply_markup=hold_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:prices")
+async def admin_prices(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_admin_prices(), reply_markup=prices_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:roles")
+async def admin_roles(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_roles(), reply_markup=roles_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:workspaces")
+async def admin_workspaces(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_workspaces(), reply_markup=workspaces_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:group_stats_panel")
+async def admin_group_stats_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, "<b>📈 Выберите группу / топик для статистики:</b>", reply_markup=group_stats_list_kb())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:groupstat:"))
+async def admin_groupstat_open(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, chat_id, thread_id = callback.data.split(":")
+    chat_id = int(chat_id)
+    thread = int(thread_id)
+    thread = None if thread == 0 else thread
+    await safe_edit_or_send(callback, render_single_group_stats(chat_id, thread), reply_markup=single_group_stats_kb(chat_id, thread))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:group_remove:"))
+async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, chat_id, thread_id = callback.data.split(":")
+    thread = None if int(thread_id) == 0 else int(thread_id)
+    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    db.conn.commit()
+    await state.clear()
+    await safe_edit_or_send(callback, "✅ Группа/топик убраны из админ-списка.", reply_markup=admin_back_kb("admin:group_stats_panel"))
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:settings")
+async def admin_settings(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "admin:operator_modes")
+async def admin_operator_modes(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:toggle_avail:"))
+async def admin_toggle_avail(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, mode, operator_key = callback.data.split(":")
+    set_operator_mode_enabled(operator_key, mode, not is_operator_mode_enabled(operator_key, mode))
+    await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
+    await callback.answer("Статус обновлён")
+
+
+@router.callback_query(F.data == "admin:design")
+async def admin_design(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_design(), reply_markup=design_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:templates")
+async def admin_templates(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_templates(), reply_markup=design_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(render_broadcast(), reply_markup=broadcast_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast_write")
+async def admin_broadcast_write(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_broadcast_text)
+    await callback.message.answer(
+        "Отправьте текст рассылки одним сообщением.\n\nМожно использовать HTML Telegram: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;blockquote&gt;</code>."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast_preview")
+async def admin_broadcast_preview(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    ad = db.get_setting("broadcast_text", "").strip()
+    await callback.message.answer(ad or "Рассылка пока пустая.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast_send_ad")
+async def admin_broadcast_send_ad(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    ad = db.get_setting("broadcast_text", "").strip()
+    if not ad:
+        await callback.answer("Сначала сохрани рассылку", show_alert=True)
+        return
+    sent = 0
+    for uid in db.all_user_ids():
+        try:
+            await callback.bot.send_message(uid, ad)
+            sent += 1
+        except Exception:
+            pass
+    await callback.message.answer(f"✅ Рассылка завершена. Доставлено: <b>{sent}</b>")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:usernames")
+async def admin_usernames(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    content = db.export_usernames().encode("utf-8")
+    file = BufferedInputFile(content, filename="usernames.txt")
+    await callback.message.answer_document(file, caption="📥 Собранные username и user_id")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:download_db")
+async def admin_download_db(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    path = Path(DB_PATH)
+    if not path.exists():
+        await callback.answer("База не найдена", show_alert=True)
+        return
+    await callback.message.answer_document(FSInputFile(path), caption="<b>📦 SQLite база</b>")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:upload_db")
+async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_db_upload)
+    await callback.message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:set_start_text")
+async def admin_set_start_text(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_start_text)
+    await callback.message.answer(
+        "Отправьте новый стартовый текст в формате:\n\n<code>Заголовок\nПодзаголовок\nОписание</code>\n\nПервые 2 строки пойдут в шапку, остальное в описание."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:set_ad_text")
+async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_ad_text)
+    await callback.message.answer(
+        "Отправьте текст рассылки.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:add_operator")
+async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_new_operator)
+    await callback.message.answer(
+        "Отправьте нового оператора в формате:\n\n<code>key | Название | цена | /команда</code>\n\nПример:\n<code>sber | Сбер | 4.5 | /sber</code>\n\nЕсли команду не указать, будет использовано <code>/key</code>."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:remove_operator")
+async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_remove_operator)
+    removable = []
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    for key, data in OPERATORS.items():
+        if key not in base_keys:
+            removable.append(f"• <code>{key}</code> — {escape(data.get('title', key))}")
+    removable_text = "\n".join(removable) if removable else "• Нет добавленных операторов для удаления."
+    await callback.message.answer(
+        "<b>➖ Удаление оператора</b>\n\n"
+        "Отправьте <code>key</code> оператора, которого нужно удалить.\n\n"
+        f"{removable_text}\n\n"
+        "Базовых операторов удалить нельзя."
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:set_hold")
+async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_hold)
+    await callback.message.answer("Введите новый Холд в минутах:")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:set_min_withdraw")
+async def admin_set_min_withdraw(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_min_withdraw)
+    await callback.message.answer("Введите новый минимальный вывод в $:")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:treasury_add")
+async def admin_treasury_add(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_treasury_invoice)
+    await callback.message.answer("Введите сумму пополнения казны в $ для создания <b>Crypto Bot invoice</b>:")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:treasury_sub")
+async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_treasury_sub)
+    await callback.message.answer("Введите сумму вывода казны в $ — будет создан <b>реальный чек Crypto Bot</b>:")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:set_price:"))
+async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split(":")
+    if len(parts) == 4:
+        _, _, price_mode, operator_key = parts
+    elif len(parts) == 5:
+        _, _, _, price_mode, operator_key = parts
+    else:
+        await callback.answer("Некорректные данные прайса", show_alert=True)
+        return
+    if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
+        await callback.answer("Некорректные данные прайса", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_operator_price)
+    await state.update_data(operator_key=operator_key, price_mode=price_mode)
+    await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> в $:")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:role:"))
+async def admin_role_action(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    role = callback.data.split(":")[-1]
+    if role == "chief_admin" and callback.from_user.id != CHIEF_ADMIN_ID:
+        await callback.answer("Назначать главного админа может только главный админ.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_role_user)
+    await state.update_data(role_target=role)
+    await callback.message.answer("Отправьте ID пользователя, которому нужно назначить роль. Для снятия роли тоже отправьте ID.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:ws_help_group")
+async def admin_ws_help_group(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.answer("Чтобы добавить рабочую группу, зайдите в нужную группу и отправьте команду <code>/work</code>.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:ws_help_topic")
+async def admin_ws_help_topic(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.answer("Чтобы добавить рабочий топик, зайдите в нужный топик и отправьте команду <code>/topic</code>.")
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_new_operator)
+async def admin_new_operator_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or '').strip()
+    parts = [x.strip() for x in raw.split('|')]
+    if len(parts) < 3:
+        await message.answer("Неверный формат. Пример: <code>sber | Сбер | 4.5 | /sber</code>")
+        return
+    key = re.sub(r'[^a-z0-9_]+', '', parts[0].lower())
+    title = parts[1].strip()
+    if not key or not title:
+        await message.answer("Укажите корректный key и название.")
+        return
+    try:
+        price = float(parts[2].replace(',', '.'))
+    except Exception:
+        await message.answer("Цена должна быть числом.")
+        return
+    command = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else f'/{key}'
+    if not command.startswith('/'):
+        command = '/' + command
+    extra_items = load_extra_operator_items()
+    updated = False
+    for item in extra_items:
+        if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
+            item.update({'key': key, 'title': title, 'price': price, 'command': command})
+            updated = True
+            break
+    if not updated and key not in OPERATORS:
+        extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
+    elif key in OPERATORS and key not in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
+        for item in extra_items:
+            if isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key:
+                item.update({'key': key, 'title': title, 'price': price, 'command': command})
+                updated = True
+                break
+        if not updated:
+            extra_items.append({'key': key, 'title': title, 'price': price, 'command': command})
+    elif key in {'mts','mts_premium','bil','mega','t2','vtb','gaz'}:
+        OPERATORS[key]['title'] = title
+        OPERATORS[key]['price'] = price
+        OPERATORS[key]['command'] = command
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
+    db.set_setting(f'price_{key}', str(price))
+    db.set_setting(f'price_hold_{key}', str(price))
+    db.set_setting(f'price_no_hold_{key}', str(price))
+    db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
+    db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+    await state.clear()
+    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key})", reply_markup=admin_root_kb())
+
+
+@router.message(AdminStates.waiting_remove_operator)
+async def admin_remove_operator_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    key = re.sub(r'[^a-z0-9_]+', '', (message.text or '').strip().lower())
+    if not key:
+        await message.answer("Отправьте key оператора.")
+        return
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    if key in base_keys:
+        await message.answer("Базового оператора удалить нельзя.")
+        return
+    if key not in OPERATORS:
+        await message.answer("Оператор не найден.")
+        return
+    extra_items = load_extra_operator_items()
+    extra_items = [item for item in extra_items if not (isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key)]
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
+    title = OPERATORS.get(key, {}).get('title', key)
+    try:
+        del OPERATORS[key]
+    except Exception:
+        pass
+    try:
+        CUSTOM_OPERATOR_EMOJI.pop(key, None)
+    except Exception:
+        pass
+    db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
+    db.conn.commit()
+    await state.clear()
+    await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
+
+@router.message(AdminStates.waiting_hold)
+async def admin_hold_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = int(float((message.text or '').replace(',', '.')))
+    except Exception:
+        await message.answer("Введите число.")
+        return
+    db.set_setting("hold_minutes", str(value))
+    await state.clear()
+    await message.answer("✅ Холд обновлён.", reply_markup=admin_root_kb())
+
+
+@router.message(AdminStates.waiting_min_withdraw)
+async def admin_min_withdraw_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or '').replace(',', '.'))
+    except Exception:
+        await message.answer("Введите число.")
+        return
+    db.set_setting("min_withdraw", str(value))
+    await state.clear()
+    await message.answer("✅ Минимальный вывод обновлён.")
+
+
+@router.message(AdminStates.waiting_treasury_invoice)
+async def admin_treasury_add_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or '').replace(',', '.'))
+    except Exception:
+        await message.answer("Введите число.")
+        return
+    invoice_id, pay_url, status_msg = await create_crypto_invoice(value, "Treasury top up")
+    if not invoice_id or not pay_url:
+        await message.answer(f"❌ {status_msg}")
+        return
+    local_id = db.create_treasury_invoice(value, invoice_id, pay_url, message.from_user.id)
+    await state.clear()
+    await message.answer(
+        "<b>✅ Инвойс на пополнение казны создан</b>\n\n"
+        f"🧾 Локальный ID: <b>#{local_id}</b>\n"
+        f"💸 Сумма: <b>{usd(value)}</b>\n"
+        f"🔗 Ссылка на оплату:\n{pay_url}\n\n"
+        "После оплаты зайдите в казну и нажмите <b>Проверить оплату</b>."
+    )
+
+
+@router.message(AdminStates.waiting_treasury_sub)
+async def admin_treasury_sub_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or '').replace(',', '.'))
+    except Exception:
+        await message.answer("Введите число.")
+        return
+    if value > db.get_treasury():
+        await message.answer("⚠️ В казне недостаточно средств.")
+        return
+    check_id, check_url, status_msg = await create_crypto_check(value)
+    if not check_id or not check_url:
+        await message.answer(f"❌ {status_msg}")
+        return
+    db.subtract_treasury(value)
+    await state.clear()
+    await message.answer(
+        "<b>✅ Вывод казны создан</b>\n\n"
+        f"💸 Сумма: <b>{usd(value)}</b>\n"
+        f"🎟 Чек: {check_url}\n"
+        f"💰 Остаток казны: <b>{usd(db.get_treasury())}</b>"
+    )
+
+
+@router.message(AdminStates.waiting_operator_price)
+async def admin_operator_price_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or '').replace(',', '.'))
+    except Exception:
+        await message.answer("Введите число.")
+        return
+    data = await state.get_data()
+    operator_key = data.get("operator_key")
+    price_mode = data.get("price_mode", "hold")
+    if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
+        await state.clear()
+        await message.answer("Ошибка данных прайса. Откройте раздел прайсов заново.")
+        return
+    db.set_setting(f"price_{price_mode}_{operator_key}", str(value))
+    await state.clear()
+    await message.answer(
+        f"✅ Прайс обновлён: {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> = <b>{usd(value)}</b>",
+        reply_markup=admin_root_kb(),
+    )
+
+
+@router.message(AdminStates.waiting_role_user)
+async def admin_role_user_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        target_id = int((message.text or '').strip())
+    except Exception:
+        await message.answer("Нужен числовой ID.")
+        return
+    data = await state.get_data()
+    role_target = data.get("role_target")
+    if role_target == "remove":
+        if target_id == CHIEF_ADMIN_ID:
+            await message.answer("Главного админа снять нельзя.")
+            await state.clear()
+            return
+        db.remove_role(target_id)
+        await message.answer("✅ Роль снята.")
+    else:
+        if role_target == "chief_admin" and message.from_user.id != CHIEF_ADMIN_ID:
+            await message.answer("Назначать главного админа может только главный админ.")
+            await state.clear()
+            return
+        db.set_role(target_id, role_target)
+        await message.answer(f"✅ Роль назначена: {role_target}")
+    await state.clear()
+
+
+@router.message(AdminStates.waiting_start_text)
+async def admin_start_text_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    parts = [x.strip() for x in (message.text or "").splitlines() if x.strip()]
+    if len(parts) < 2:
+        await message.answer("Нужно минимум 2 строки: заголовок и подзаголовок.")
+        return
+    db.set_setting("start_title", parts[0])
+    db.set_setting("start_subtitle", parts[1])
+    db.set_setting("start_description", "\n".join(parts[2:]) if len(parts) > 2 else "")
+    await state.clear()
+    await message.answer("✅ Стартовое оформление обновлено.")
+
+
+@router.message(AdminStates.waiting_ad_text)
+async def admin_ad_text_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    db.set_setting("broadcast_text", message.html_text or (message.text or ""))
+    await state.clear()
+    await message.answer("✅ Объявление сохранено.")
+
+
+@router.message(AdminStates.waiting_broadcast_text)
+async def admin_broadcast_text_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    db.set_setting("broadcast_text", message.html_text or (message.text or ""))
+    await state.clear()
+    await message.answer("✅ Текст сохранён как активная рассылка. Теперь его можно превьюнуть и разослать из /admin.")
+
+
+@router.message(Command("work"))
+async def enable_work_group(message: Message):
+    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Эта команда работает только в группе.")
+        return
+    if db.is_workspace_enabled(message.chat.id, None, "group"):
+        db.disable_workspace(message.chat.id, None, "group")
+        await message.answer("🛑 Работа в этой группе выключена.")
+    else:
+        db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+        await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+
+
+@router.message(Command("topic"))
+async def enable_work_topic(message: Message):
+    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Эта команда работает только в топике группы.")
+        return
+    thread_id = getattr(message, "message_thread_id", None)
+    if not thread_id:
+        await message.answer("Открой нужный топик и выполни /topic внутри него.")
+        return
+    if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
+        db.disable_workspace(message.chat.id, thread_id, "topic")
+        await message.answer("🛑 Работа в этом топике выключена.")
+    else:
+        db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+        await message.answer("✅ Этот топик добавлен как рабочий.")
+
+
+async def send_next_item_for_operator(message: Message, operator_key: str):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("Команда работает только в рабочей группе или топике.")
+        return
+    thread_id = getattr(message, "message_thread_id", None)
+    allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
+    if not allowed:
+        allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    if not allowed:
+        await message.answer("Эта группа/топик не включены как рабочая зона. Используй /work или /topic от админа.")
+        return
+    item = db.get_next_queue_item(operator_key)
+    if not item:
+        await message.answer(f"📭 Для оператора {op_text(operator_key)} очередь пуста.")
+        return
+    group_price = group_price_for_take(message.chat.id, thread_id, item.operator_key, item.mode)
+    if db.get_group_balance(message.chat.id, thread_id) + 1e-9 < group_price:
+        await message.answer(f"Недостаточно средств в казне группы. Нужно {usd(group_price)}")
+        return
+    if not db.reserve_queue_item_for_group(item.id, message.from_user.id, message.chat.id, thread_id, group_price):
+        await message.answer("Заявку уже забрали.")
+        return
+    item = db.get_queue_item(item.id)
+    try:
+        await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, queue_caption(item), reply_markup=admin_queue_kb(item), message_thread_id=thread_id)
+    except Exception:
+        db.release_item_reservation(item.id)
+        db.conn.execute("UPDATE queue_items SET status='queued', taken_by_admin=NULL, taken_at=NULL WHERE id=?", (item.id,))
+        db.conn.commit()
+        raise
+
+
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2"))
+async def legacy_take_commands(message: Message):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
+
+
+@router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
+async def dynamic_operator_command_stub(message: Message):
+    if not is_operator_or_admin(message.from_user.id):
+        return
+    raw = (message.text or '').split()[0].split('@')[0].lower()
+    if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
+        return
+    if raw in operator_command_map():
+        await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
+
+
+
+def extract_custom_emoji_ids(message: Message) -> list[str]:
+    ids = []
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for ent in entities:
+        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            ids.append(ent.custom_emoji_id)
+    return ids
+
+def build_sticker_info_lines(sticker=None, custom_ids=None):
+    lines = []
+    if sticker:
+        lines.append(f"<b>file_id:</b> <code>{sticker.file_id}</code>")
+        lines.append(f"<b>file_unique_id:</b> <code>{sticker.file_unique_id}</code>")
+        if getattr(sticker, 'set_name', None):
+            lines.append(f"<b>set_name:</b> <code>{sticker.set_name}</code>")
+        if getattr(sticker, 'emoji', None):
+            lines.append(f"<b>emoji:</b> {escape(sticker.emoji)}")
+        if getattr(sticker, 'custom_emoji_id', None):
+            lines.append(f"<b>custom_emoji_id:</b> <code>{sticker.custom_emoji_id}</code>")
+        if getattr(sticker, 'is_animated', None) is not None:
+            lines.append(f"<b>animated:</b> <code>{sticker.is_animated}</code>")
+        if getattr(sticker, 'is_video', None) is not None:
+            lines.append(f"<b>video:</b> <code>{sticker.is_video}</code>")
+    for cid in custom_ids or []:
+        lines.append(f"<b>custom_emoji_id:</b> <code>{cid}</code>")
+    return lines
+
+@router.message(Command("stickerid", "emojiid", "premiumemojiid"))
 async def stickerid_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
