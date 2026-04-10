@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -66,6 +67,36 @@ WITHDRAW_BANNER = "withdraw_banner.jpg"
 MSK_OFFSET = timedelta(hours=3)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", mode="a", encoding="utf-8")])
+logging.info("Railway logging enabled: stdout + bot.log")
+
+_HANDLED_EVENT_KEYS: dict[tuple, float] = {}
+
+
+def consume_event_once(*parts, ttl_seconds: int = 120) -> bool:
+    now_ts = time.time()
+    stale_keys = [key for key, seen_at in _HANDLED_EVENT_KEYS.items() if now_ts - seen_at > ttl_seconds]
+    for key in stale_keys:
+        _HANDLED_EVENT_KEYS.pop(key, None)
+    key = tuple(parts)
+    if key in _HANDLED_EVENT_KEYS:
+        logging.warning("duplicate event skipped: %s", key)
+        return False
+    _HANDLED_EVENT_KEYS[key] = now_ts
+    return True
+
+def debug_workspace_rows(chat_id: int):
+    try:
+        rows = db.conn.execute(
+            "SELECT id, chat_id, thread_id, mode, is_enabled, added_by, created_at FROM workspaces WHERE chat_id=? ORDER BY id DESC",
+            (chat_id,),
+        ).fetchall()
+        payload = [dict(row) for row in rows]
+        logging.info("workspace rows chat_id=%s => %s", chat_id, payload)
+        return payload
+    except Exception:
+        logging.exception("workspace rows inspect failed chat_id=%s", chat_id)
+        return []
+
 router = Router()
 
 LIVE_MIRROR_TASKS = {}
@@ -4158,36 +4189,86 @@ async def admin_broadcast_text_value(message: Message, state: FSMContext):
 
 @router.message(Command("work"))
 async def enable_work_group(message: Message):
-    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+    logging.info("/work received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_work", message.chat.id, message.message_id):
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эта команда работает только в группе.")
         return
-    if db.is_workspace_enabled(message.chat.id, None, "group"):
-        db.disable_workspace(message.chat.id, None, "group")
-        await message.answer("🛑 Работа в этой группе выключена.")
-    else:
-        db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
-        await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+    if not message.from_user:
+        logging.warning("/work ignored: no from_user chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        return
+    allowed = is_admin(message.from_user.id) or user_role(message.from_user.id) == "chief_admin"
+    member_status = "unknown"
+    if not allowed:
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+            member_status = getattr(member, "status", "unknown")
+            allowed = member_status in {"creator", "administrator"}
+        except Exception:
+            logging.exception("/work get_chat_member failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+    logging.info("/work access chat_id=%s user_id=%s allowed=%s role=%s member_status=%s", message.chat.id, message.from_user.id, allowed, user_role(message.from_user.id), member_status)
+    if not allowed:
+        await message.answer("Команду /work может использовать только админ.")
+        return
+    try:
+        before_rows = debug_workspace_rows(message.chat.id)
+        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, getattr(message, "message_thread_id", None), before_rows)
+        if db.is_workspace_enabled(message.chat.id, None, "group"):
+            db.disable_workspace(message.chat.id, None, "group")
+            after_rows = debug_workspace_rows(message.chat.id)
+            logging.info("/work disabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            await message.answer("🛑 Работа в этой группе выключена.")
+        else:
+            db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+            after_rows = debug_workspace_rows(message.chat.id)
+            logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+    except Exception:
+        logging.exception("/work failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+        await message.answer("❌ Ошибка при включении рабочей группы. Лог уже записан в Railway.")
 
 
 @router.message(Command("topic"))
 async def enable_work_topic(message: Message):
-    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+    logging.info("/topic received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_topic", message.chat.id, message.message_id):
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эта команда работает только в топике группы.")
+        return
+    if not message.from_user:
+        logging.warning("/topic ignored: no from_user chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        return
+    allowed = is_admin(message.from_user.id) or user_role(message.from_user.id) == "chief_admin"
+    member_status = "unknown"
+    if not allowed:
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+            member_status = getattr(member, "status", "unknown")
+            allowed = member_status in {"creator", "administrator"}
+        except Exception:
+            logging.exception("/topic get_chat_member failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+    logging.info("/topic access chat_id=%s user_id=%s allowed=%s role=%s member_status=%s", message.chat.id, message.from_user.id, allowed, user_role(message.from_user.id), member_status)
+    if not allowed:
+        await message.answer("Команду /topic может использовать только админ.")
         return
     thread_id = getattr(message, "message_thread_id", None)
     if not thread_id:
         await message.answer("Открой нужный топик и выполни /topic внутри него.")
         return
-    if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
-        db.disable_workspace(message.chat.id, thread_id, "topic")
-        await message.answer("🛑 Работа в этом топике выключена.")
-    else:
-        db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
-        await message.answer("✅ Этот топик добавлен как рабочий.")
+    try:
+        if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
+            db.disable_workspace(message.chat.id, thread_id, "topic")
+            logging.info("/topic disabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
+            await message.answer("🛑 Работа в этом топике выключена.")
+        else:
+            db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+            logging.info("/topic enabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
+            await message.answer("✅ Этот топик добавлен как рабочий.")
+    except Exception:
+        logging.exception("/topic failed chat_id=%s thread_id=%s user_id=%s", message.chat.id, thread_id, message.from_user.id)
+        await message.answer("❌ Ошибка при включении рабочего топика. Лог уже записан в Railway.")
 
 
 async def send_next_item_for_operator(message: Message, operator_key: str):
@@ -4197,9 +4278,10 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         await message.answer("Команда работает только в рабочей группе или топике.")
         return
     thread_id = getattr(message, "message_thread_id", None)
-    allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
-    if not allowed:
-        allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    topic_allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
+    group_allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    allowed = topic_allowed or group_allowed
+    logging.info("send_next_item workspace check chat_id=%s thread_id=%s topic_allowed=%s group_allowed=%s allowed=%s rows=%s", message.chat.id, thread_id, topic_allowed, group_allowed, allowed, debug_workspace_rows(message.chat.id))
     if not allowed:
         await message.answer("Эта группа/топик не включены как рабочая зона. Используй /work или /topic от админа.")
         return
@@ -4302,16 +4384,20 @@ async def emoji_lookup_waiting(message: Message, state: FSMContext):
     await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
 @router.message(Command("esim"))
 async def esim_command(message: Message):
-    if not is_operator_or_admin(message.from_user.id):
+    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_esim", message.chat.id, message.message_id):
+        return
+    if not message.from_user or not is_operator_or_admin(message.from_user.id):
+        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None))
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
         return
     thread_id = getattr(message, "message_thread_id", None)
-    if thread_id:
-        allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic")
-    else:
-        allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    topic_allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
+    group_allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    allowed = topic_allowed or group_allowed
+    logging.info("/esim workspace check chat_id=%s thread_id=%s topic_allowed=%s group_allowed=%s allowed=%s rows=%s", message.chat.id, thread_id, topic_allowed, group_allowed, allowed, debug_workspace_rows(message.chat.id))
     if not allowed:
         await message.answer("Эта группа или топик не включены как рабочая зона. Используй /work или /topic.")
         return
@@ -5474,36 +5560,86 @@ async def admin_broadcast_text_value(message: Message, state: FSMContext):
 
 @router.message(Command("work"))
 async def enable_work_group(message: Message):
-    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+    logging.info("/work received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_work", message.chat.id, message.message_id):
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эта команда работает только в группе.")
         return
-    if db.is_workspace_enabled(message.chat.id, None, "group"):
-        db.disable_workspace(message.chat.id, None, "group")
-        await message.answer("🛑 Работа в этой группе выключена.")
-    else:
-        db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
-        await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+    if not message.from_user:
+        logging.warning("/work ignored: no from_user chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        return
+    allowed = is_admin(message.from_user.id) or user_role(message.from_user.id) == "chief_admin"
+    member_status = "unknown"
+    if not allowed:
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+            member_status = getattr(member, "status", "unknown")
+            allowed = member_status in {"creator", "administrator"}
+        except Exception:
+            logging.exception("/work get_chat_member failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+    logging.info("/work access chat_id=%s user_id=%s allowed=%s role=%s member_status=%s", message.chat.id, message.from_user.id, allowed, user_role(message.from_user.id), member_status)
+    if not allowed:
+        await message.answer("Команду /work может использовать только админ.")
+        return
+    try:
+        before_rows = debug_workspace_rows(message.chat.id)
+        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, getattr(message, "message_thread_id", None), before_rows)
+        if db.is_workspace_enabled(message.chat.id, None, "group"):
+            db.disable_workspace(message.chat.id, None, "group")
+            after_rows = debug_workspace_rows(message.chat.id)
+            logging.info("/work disabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            await message.answer("🛑 Работа в этой группе выключена.")
+        else:
+            db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+            after_rows = debug_workspace_rows(message.chat.id)
+            logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
+    except Exception:
+        logging.exception("/work failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+        await message.answer("❌ Ошибка при включении рабочей группы. Лог уже записан в Railway.")
 
 
 @router.message(Command("topic"))
 async def enable_work_topic(message: Message):
-    if not is_admin(message.from_user.id) and user_role(message.from_user.id) != "chief_admin":
+    logging.info("/topic received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_topic", message.chat.id, message.message_id):
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Эта команда работает только в топике группы.")
+        return
+    if not message.from_user:
+        logging.warning("/topic ignored: no from_user chat_id=%s message_id=%s", message.chat.id, message.message_id)
+        return
+    allowed = is_admin(message.from_user.id) or user_role(message.from_user.id) == "chief_admin"
+    member_status = "unknown"
+    if not allowed:
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+            member_status = getattr(member, "status", "unknown")
+            allowed = member_status in {"creator", "administrator"}
+        except Exception:
+            logging.exception("/topic get_chat_member failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+    logging.info("/topic access chat_id=%s user_id=%s allowed=%s role=%s member_status=%s", message.chat.id, message.from_user.id, allowed, user_role(message.from_user.id), member_status)
+    if not allowed:
+        await message.answer("Команду /topic может использовать только админ.")
         return
     thread_id = getattr(message, "message_thread_id", None)
     if not thread_id:
         await message.answer("Открой нужный топик и выполни /topic внутри него.")
         return
-    if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
-        db.disable_workspace(message.chat.id, thread_id, "topic")
-        await message.answer("🛑 Работа в этом топике выключена.")
-    else:
-        db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
-        await message.answer("✅ Этот топик добавлен как рабочий.")
+    try:
+        if db.is_workspace_enabled(message.chat.id, thread_id, "topic"):
+            db.disable_workspace(message.chat.id, thread_id, "topic")
+            logging.info("/topic disabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
+            await message.answer("🛑 Работа в этом топике выключена.")
+        else:
+            db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+            logging.info("/topic enabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
+            await message.answer("✅ Этот топик добавлен как рабочий.")
+    except Exception:
+        logging.exception("/topic failed chat_id=%s thread_id=%s user_id=%s", message.chat.id, thread_id, message.from_user.id)
+        await message.answer("❌ Ошибка при включении рабочего топика. Лог уже записан в Railway.")
 
 
 async def send_next_item_for_operator(message: Message, operator_key: str):
@@ -5513,9 +5649,10 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         await message.answer("Команда работает только в рабочей группе или топике.")
         return
     thread_id = getattr(message, "message_thread_id", None)
-    allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
-    if not allowed:
-        allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    topic_allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
+    group_allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    allowed = topic_allowed or group_allowed
+    logging.info("send_next_item workspace check chat_id=%s thread_id=%s topic_allowed=%s group_allowed=%s allowed=%s rows=%s", message.chat.id, thread_id, topic_allowed, group_allowed, allowed, debug_workspace_rows(message.chat.id))
     if not allowed:
         await message.answer("Эта группа/топик не включены как рабочая зона. Используй /work или /topic от админа.")
         return
@@ -5617,26 +5754,32 @@ async def emoji_lookup_waiting(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
 @router.message(Command("esim"))
-
 async def esim_command(message: Message):
-    if not is_operator_or_admin(message.from_user.id):
+    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    if not consume_event_once("cmd_esim", message.chat.id, message.message_id):
+        return
+    if not message.from_user or not is_operator_or_admin(message.from_user.id):
+        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None))
         return
     if message.chat.type == ChatType.PRIVATE:
-        await message.answer('Команда работает только в рабочей группе или топике.')
+        await message.answer("Команда работает только в рабочей группе или топике.")
         return
-    thread_id = getattr(message, 'message_thread_id', None)
-    if thread_id:
-        allowed = db.is_workspace_enabled(message.chat.id, thread_id, 'topic')
-    else:
-        allowed = db.is_workspace_enabled(message.chat.id, None, 'group')
+    thread_id = getattr(message, "message_thread_id", None)
+    topic_allowed = db.is_workspace_enabled(message.chat.id, thread_id, "topic") if thread_id else False
+    group_allowed = db.is_workspace_enabled(message.chat.id, None, "group")
+    allowed = topic_allowed or group_allowed
+    logging.info("/esim workspace check chat_id=%s thread_id=%s topic_allowed=%s group_allowed=%s allowed=%s rows=%s", message.chat.id, thread_id, topic_allowed, group_allowed, allowed, debug_workspace_rows(message.chat.id))
     if not allowed:
-        await message.answer('Эта группа или топик не включены как рабочая зона. Используй /work или /topic.')
+        await message.answer("Эта группа или топик не включены как рабочая зона. Используй /work или /topic.")
         return
-    await message.answer('<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:', reply_markup=esim_mode_kb(message.from_user.id))
+    await message.answer("<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:", reply_markup=esim_mode_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "esim:back_mode")
 async def esim_back_mode(callback: CallbackQuery):
+    if not consume_event_once("cb_esim_back", callback.id):
+        await callback.answer()
+        return
     if not is_operator_or_admin(callback.from_user.id):
         return
     text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
@@ -5647,6 +5790,9 @@ async def esim_back_mode(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("esim_mode:"))
 async def esim_choose_mode(callback: CallbackQuery):
     logging.info("esim_choose_mode callback=%s", callback.data)
+    if not consume_event_once("cb_esim_mode", callback.id):
+        await callback.answer()
+        return
     if not is_operator_or_admin(callback.from_user.id):
         return
     mode = callback.data.split(':', 1)[1]
@@ -5659,11 +5805,17 @@ async def esim_choose_mode(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("esim_take:"))
 async def esim_take(callback: CallbackQuery):
     logging.info("esim_take callback=%s", callback.data)
+    if not consume_event_once("cb_esim_take", callback.id):
+        await callback.answer()
+        return
     if not is_operator_or_admin(callback.from_user.id):
         return
     _, operator_key, mode = callback.data.split(':')
     thread_id = getattr(callback.message, 'message_thread_id', None)
-    allowed = db.is_workspace_enabled(callback.message.chat.id, thread_id if thread_id else None, 'topic' if thread_id else 'group')
+    topic_allowed = db.is_workspace_enabled(callback.message.chat.id, thread_id, 'topic') if thread_id else False
+    group_allowed = db.is_workspace_enabled(callback.message.chat.id, None, 'group')
+    allowed = topic_allowed or group_allowed
+    logging.info("esim_take workspace check chat_id=%s thread_id=%s topic_allowed=%s group_allowed=%s allowed=%s rows=%s", callback.message.chat.id, thread_id, topic_allowed, group_allowed, allowed, debug_workspace_rows(callback.message.chat.id))
     if not allowed:
         await callback.answer('Рабочая зона не активирована', show_alert=True)
         return
