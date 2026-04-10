@@ -983,6 +983,26 @@ def is_operator_or_admin(user_id: int) -> bool:
     return user_role(user_id) in {"chief_admin", "admin", "operator"}
 
 
+async def message_actor_can_take_esim(message: Message) -> tuple[bool, str]:
+    user = getattr(message, "from_user", None)
+    if not user:
+        return False, "no_user"
+    role = user_role(user.id)
+    if role in {"chief_admin", "admin", "operator"}:
+        return True, f"internal_role:{role}"
+    if message.chat.type == ChatType.PRIVATE:
+        return False, f"internal_role:{role or 'none'}"
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, user.id)
+        status = getattr(member, "status", "unknown")
+        if status in {"creator", "administrator"}:
+            return True, f"chat_admin:{status}"
+        return False, f"chat_member:{status}"
+    except Exception:
+        logging.exception("message_actor_can_take_esim failed chat_id=%s user_id=%s", message.chat.id, user.id)
+        return False, f"internal_role:{role or 'none'}"
+
+
 def is_chief_admin(user_id: int) -> bool:
     return user_role(user_id) == "chief_admin"
 
@@ -4213,7 +4233,8 @@ async def enable_work_group(message: Message):
         return
     try:
         before_rows = debug_workspace_rows(message.chat.id)
-        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, getattr(message, "message_thread_id", None), before_rows)
+        thread_id = getattr(message, "message_thread_id", None)
+        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, thread_id, before_rows)
         if db.is_workspace_enabled(message.chat.id, None, "group"):
             db.disable_workspace(message.chat.id, None, "group")
             after_rows = debug_workspace_rows(message.chat.id)
@@ -4221,6 +4242,9 @@ async def enable_work_group(message: Message):
             await message.answer("🛑 Работа в этой группе выключена.")
         else:
             db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+            if thread_id:
+                db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+                logging.info("/work auto-enabled current topic chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             after_rows = debug_workspace_rows(message.chat.id)
             logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
             await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
@@ -4272,7 +4296,10 @@ async def enable_work_topic(message: Message):
 
 
 async def send_next_item_for_operator(message: Message, operator_key: str):
-    if not is_operator_or_admin(message.from_user.id):
+    allowed_actor, actor_reason = await message_actor_can_take_esim(message)
+    logging.info("send_next_item actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
+    if not allowed_actor:
+        await message.answer("Брать номера могут только операторы, админы бота или админы этой группы.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
@@ -4384,11 +4411,14 @@ async def emoji_lookup_waiting(message: Message, state: FSMContext):
     await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
 @router.message(Command("esim"))
 async def esim_command(message: Message):
-    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s text=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None), message.text)
     if not consume_event_once("cmd_esim", message.chat.id, message.message_id):
         return
-    if not message.from_user or not is_operator_or_admin(message.from_user.id):
-        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None))
+    allowed_actor, actor_reason = await message_actor_can_take_esim(message)
+    logging.info("/esim actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
+    if not allowed_actor:
+        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s reason=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), actor_reason)
+        await message.answer("Использовать /esim могут только операторы, админы бота или админы этой группы.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
@@ -5584,7 +5614,8 @@ async def enable_work_group(message: Message):
         return
     try:
         before_rows = debug_workspace_rows(message.chat.id)
-        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, getattr(message, "message_thread_id", None), before_rows)
+        thread_id = getattr(message, "message_thread_id", None)
+        logging.info("/work before toggle chat_id=%s thread_id=%s rows=%s", message.chat.id, thread_id, before_rows)
         if db.is_workspace_enabled(message.chat.id, None, "group"):
             db.disable_workspace(message.chat.id, None, "group")
             after_rows = debug_workspace_rows(message.chat.id)
@@ -5592,6 +5623,9 @@ async def enable_work_group(message: Message):
             await message.answer("🛑 Работа в этой группе выключена.")
         else:
             db.enable_workspace(message.chat.id, None, "group", message.from_user.id)
+            if thread_id:
+                db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+                logging.info("/work auto-enabled current topic chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             after_rows = debug_workspace_rows(message.chat.id)
             logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
             await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
@@ -5643,7 +5677,10 @@ async def enable_work_topic(message: Message):
 
 
 async def send_next_item_for_operator(message: Message, operator_key: str):
-    if not is_operator_or_admin(message.from_user.id):
+    allowed_actor, actor_reason = await message_actor_can_take_esim(message)
+    logging.info("send_next_item actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
+    if not allowed_actor:
+        await message.answer("Брать номера могут только операторы, админы бота или админы этой группы.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
@@ -5755,11 +5792,14 @@ async def emoji_lookup_waiting(message: Message, state: FSMContext):
     await message.answer("<b>🎟 Данные стикера / emoji</b>\n\n" + "\n".join(lines))
 @router.message(Command("esim"))
 async def esim_command(message: Message):
-    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None))
+    logging.info("/esim received chat_id=%s message_id=%s user_id=%s thread_id=%s text=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), getattr(message, "message_thread_id", None), message.text)
     if not consume_event_once("cmd_esim", message.chat.id, message.message_id):
         return
-    if not message.from_user or not is_operator_or_admin(message.from_user.id):
-        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None))
+    allowed_actor, actor_reason = await message_actor_can_take_esim(message)
+    logging.info("/esim actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
+    if not allowed_actor:
+        logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s reason=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), actor_reason)
+        await message.answer("Использовать /esim могут только операторы, админы бота или админы этой группы.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
