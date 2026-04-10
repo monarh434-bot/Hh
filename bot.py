@@ -15,6 +15,7 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
@@ -4342,13 +4343,17 @@ async def legacy_take_commands(message: Message):
 
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
 async def dynamic_operator_command_stub(message: Message):
-    if not is_operator_or_admin(message.from_user.id):
-        return
     raw = (message.text or '').split()[0].split('@')[0].lower()
     if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
-        return
+        logging.info("dynamic_operator_command_stub skip raw=%s chat_id=%s user_id=%s", raw, message.chat.id, getattr(message.from_user, 'id', None))
+        raise SkipHandler()
+    if not message.from_user or not is_operator_or_admin(message.from_user.id):
+        raise SkipHandler()
     if raw in operator_command_map():
+        logging.info("dynamic_operator_command_stub handled raw=%s chat_id=%s user_id=%s", raw, message.chat.id, message.from_user.id)
         await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
+        return
+    raise SkipHandler()
 
 
 
@@ -5723,13 +5728,17 @@ async def legacy_take_commands(message: Message):
 
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
 async def dynamic_operator_command_stub(message: Message):
-    if not is_operator_or_admin(message.from_user.id):
-        return
     raw = (message.text or '').split()[0].split('@')[0].lower()
     if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
-        return
+        logging.info("dynamic_operator_command_stub skip raw=%s chat_id=%s user_id=%s", raw, message.chat.id, getattr(message.from_user, 'id', None))
+        raise SkipHandler()
+    if not message.from_user or not is_operator_or_admin(message.from_user.id):
+        raise SkipHandler()
     if raw in operator_command_map():
+        logging.info("dynamic_operator_command_stub handled raw=%s chat_id=%s user_id=%s", raw, message.chat.id, message.from_user.id)
         await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
+        return
+    raise SkipHandler()
 
 
 
