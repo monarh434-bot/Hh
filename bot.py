@@ -4029,7 +4029,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     custom_ids = extract_custom_emoji_ids(message)
     raw_text = (message.text or message.caption or '').strip()
     emoji_id = ''
-    fallback_emoji = '📱'
+    fallback_emoji = extract_custom_emoji_fallback(message)
 
     if raw_text.lower() not in {'skip', '/skip', 'пропуск', 'нет'}:
         if sticker and getattr(sticker, 'custom_emoji_id', None):
@@ -4038,6 +4038,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
                 fallback_emoji = str(sticker.emoji)[:2] or '📱'
         elif custom_ids:
             emoji_id = str(custom_ids[0])
+            fallback_emoji = extract_custom_emoji_fallback(message)
         elif raw_text:
             digits = re.sub(r'\D+', '', raw_text)
             if digits:
@@ -4429,6 +4430,26 @@ def extract_custom_emoji_ids(message: Message) -> list[str]:
         if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             ids.append(ent.custom_emoji_id)
     return ids
+
+
+def extract_custom_emoji_fallback(message: Message) -> str:
+    raw = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for ent in entities:
+        if getattr(ent, 'type', None) == 'custom_emoji':
+            offset = int(getattr(ent, 'offset', 0) or 0)
+            length = int(getattr(ent, 'length', 0) or 0)
+            if length > 0 and len(raw) >= offset + length:
+                fallback = raw[offset:offset + length].strip()
+                if fallback:
+                    return fallback[:2]
+    sticker = getattr(message, 'sticker', None)
+    if sticker and getattr(sticker, 'emoji', None):
+        return str(sticker.emoji).strip()[:2] or '📱'
+    raw = raw.strip()
+    if raw and not raw.isdigit():
+        return raw[:2]
+    return '📱'
 
 def build_sticker_info_lines(sticker=None, custom_ids=None):
     lines = []
@@ -5417,7 +5438,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     custom_ids = extract_custom_emoji_ids(message)
     raw_text = (message.text or message.caption or '').strip()
     emoji_id = ''
-    fallback_emoji = '📱'
+    fallback_emoji = extract_custom_emoji_fallback(message)
 
     if raw_text.lower() not in {'skip', '/skip', 'пропуск', 'нет'}:
         if sticker and getattr(sticker, 'custom_emoji_id', None):
@@ -5426,6 +5447,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
                 fallback_emoji = str(sticker.emoji)[:2] or '📱'
         elif custom_ids:
             emoji_id = str(custom_ids[0])
+            fallback_emoji = extract_custom_emoji_fallback(message)
         elif raw_text:
             digits = re.sub(r'\D+', '', raw_text)
             if digits:
@@ -5819,6 +5841,26 @@ def extract_custom_emoji_ids(message: Message) -> list[str]:
         if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             ids.append(ent.custom_emoji_id)
     return ids
+
+
+def extract_custom_emoji_fallback(message: Message) -> str:
+    raw = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for ent in entities:
+        if getattr(ent, 'type', None) == 'custom_emoji':
+            offset = int(getattr(ent, 'offset', 0) or 0)
+            length = int(getattr(ent, 'length', 0) or 0)
+            if length > 0 and len(raw) >= offset + length:
+                fallback = raw[offset:offset + length].strip()
+                if fallback:
+                    return fallback[:2]
+    sticker = getattr(message, 'sticker', None)
+    if sticker and getattr(sticker, 'emoji', None):
+        return str(sticker.emoji).strip()[:2] or '📱'
+    raw = raw.strip()
+    if raw and not raw.isdigit():
+        return raw[:2]
+    return '📱'
 
 def build_sticker_info_lines(sticker=None, custom_ids=None):
     lines = []
