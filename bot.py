@@ -2945,6 +2945,22 @@ async def start_cmd(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery):
+    try:
+        if callback.message:
+            await callback.message.delete()
+            logging.info("noop close deleted chat_id=%s message_id=%s", callback.message.chat.id, callback.message.message_id)
+            await callback.answer("Закрыто")
+            return
+    except Exception as e:
+        logging.warning("noop close delete failed: %s", e)
+    try:
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            logging.info("noop close markup removed chat_id=%s message_id=%s", callback.message.chat.id, callback.message.message_id)
+            await callback.answer("Закрыто")
+            return
+    except Exception as e:
+        logging.warning("noop close edit markup failed: %s", e)
     await callback.answer()
 
 @router.callback_query(F.data == "join:check")
