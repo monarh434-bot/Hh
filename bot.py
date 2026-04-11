@@ -1262,7 +1262,7 @@ def operators_kb(mode: str = "hold", prefix: str = "op", back_cb: str = "mode:ba
         q = count_waiting_mode(key, mode)
         price = get_mode_price(key, mode, user_id)
         prefix_mark = "🚫 " if not is_operator_mode_enabled(key, mode) else ""
-        kb.button(text=f"{prefix_mark}{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+        kb.row(make_operator_button(operator_key=key, callback_data=f"{prefix}:{key}:{mode}", prefix_mark=prefix_mark, suffix_text=f" ({q}) • {usd(price)}"))
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
@@ -1274,7 +1274,7 @@ def operators_group_kb(chat_id: int, thread_id: int | None, mode: str = "hold", 
         q = count_waiting_mode(key, mode)
         price = group_price_for_take(chat_id, thread_id, key, mode)
         prefix_mark = "🚫 " if not is_operator_mode_enabled(key, mode) else ""
-        kb.button(text=f"{prefix_mark}{op_text(key)} ({q}) • {usd(price)}", callback_data=f"{prefix}:{key}:{mode}")
+        kb.row(make_operator_button(operator_key=key, callback_data=f"{prefix}:{key}:{mode}", prefix_mark=prefix_mark, suffix_text=f" ({q}) • {usd(price)}"))
     kb.button(text="↩️ Назад", callback_data=back_cb)
     kb.adjust(1)
     return kb.as_markup()
@@ -2704,6 +2704,23 @@ def op_html(operator_key: str) -> str:
 def op_text(operator_key: str) -> str:
     fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
     return f"{fallback} {OPERATORS[operator_key]['title']}"
+
+
+def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
+    title = OPERATORS[operator_key]['title']
+    if not with_fallback:
+        return title
+    fallback = (CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1] or "📱").strip()
+    return f"{fallback} {title}"
+
+
+def make_operator_button(operator_key: str, *, callback_data: str, prefix_mark: str = "", suffix_text: str = "") -> InlineKeyboardButton:
+    emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
+    label = f"{prefix_mark}{op_button_label(operator_key, with_fallback=not bool(emoji_id))}{suffix_text}"
+    payload = {"text": label, "callback_data": callback_data}
+    if emoji_id:
+        payload["icon_custom_emoji_id"] = str(emoji_id)
+    return InlineKeyboardButton(**payload)
 
 
 async def send_banner_message(entity, banner_path: str, caption: str, reply_markup=None):
