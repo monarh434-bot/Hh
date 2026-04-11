@@ -31,7 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
 BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
 DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "Seamusstest_bot"
+BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
@@ -1362,6 +1362,7 @@ def admin_root_kb():
     kb.button(text="⏳ Холд", callback_data="admin:hold")
     kb.button(text="💎 Прайсы", callback_data="admin:prices")
     kb.button(text="➕ Добавить оператора", callback_data="admin:add_operator")
+    kb.button(text="💎 Эмодзи операторов", callback_data="admin:set_operator_emoji")
     kb.button(text="➖ Удалить оператора", callback_data="admin:remove_operator")
     kb.button(text="👥 Роли", callback_data="admin:roles")
     kb.button(text="🛰 Рабочие зоны", callback_data="admin:workspaces")
@@ -1369,6 +1370,15 @@ def admin_root_kb():
     kb.button(text="👤 Пользователь", callback_data="admin:user_tools")
     kb.button(text="⚙️ Настройки", callback_data="admin:settings")
     kb.adjust(2,2,2,2,2,2,1)
+    return kb.as_markup()
+
+
+def operator_emoji_pick_kb():
+    kb = InlineKeyboardBuilder()
+    for key in OPERATORS:
+        kb.button(text=op_text(key), callback_data=f"admin:pick_operator_emoji:{key}")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -1448,12 +1458,13 @@ def group_finance_manage_kb(chat_id: int, thread_id: int | None):
 def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
     day_start, day_end, day_label = msk_today_bounds_str()
     thread_key = db._thread_key(thread_id)
+    date_expr = "COALESCE(completed_at, work_started_at, taken_at, created_at)"
 
     totals = db.conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN taken_by_admin IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
             SUM(CASE WHEN work_started_at IS NOT NULL THEN 1 ELSE 0 END) AS started,
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
             SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
@@ -1462,13 +1473,13 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
-        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+        WHERE charge_chat_id=? AND charge_thread_id=? AND {date_expr}>=? AND {date_expr}<?
         """,
         (int(chat_id), thread_key, day_start, day_end),
     ).fetchone()
 
     per_operator = db.conn.execute(
-        """
+        f"""
         SELECT
             operator_key,
             COUNT(*) AS total,
@@ -1476,7 +1487,7 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
             SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
             SUM(COALESCE(charge_amount, price)) AS turnover_total
         FROM queue_items
-        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+        WHERE charge_chat_id=? AND charge_thread_id=? AND {date_expr}>=? AND {date_expr}<?
         GROUP BY operator_key
         ORDER BY total DESC, operator_key ASC
         """,
@@ -1484,14 +1495,14 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
     ).fetchall()
 
     per_taker = db.conn.execute(
-        """
+        f"""
         SELECT
             taken_by_admin AS taker_user_id,
             COUNT(*) AS total,
             SUM(COALESCE(charge_amount, price)) AS turnover_total,
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total
         FROM queue_items
-        WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<? AND taken_by_admin IS NOT NULL
+        WHERE charge_chat_id=? AND charge_thread_id=? AND {date_expr}>=? AND {date_expr}<? AND taken_by_admin IS NOT NULL
         GROUP BY taken_by_admin
         ORDER BY total DESC
         """,
@@ -1839,8 +1850,9 @@ def render_mirror_menu(user_id: int) -> str:
 
 def render_group_stats_panel() -> str:
     day_start, day_end, day_label = msk_today_bounds_str()
+    date_expr = "COALESCE(completed_at, work_started_at, taken_at, created_at)"
     totals = db.conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN taken_by_admin IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
@@ -1852,13 +1864,13 @@ def render_group_stats_panel() -> str:
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS turnover_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<?
+        WHERE charge_chat_id IS NOT NULL AND {date_expr}>=? AND {date_expr}<?
         """,
         (day_start, day_end),
     ).fetchone()
 
     per_operator = db.conn.execute(
-        """
+        f"""
         SELECT
             operator_key,
             COUNT(*) AS total,
@@ -1866,7 +1878,7 @@ def render_group_stats_panel() -> str:
             SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
             SUM(COALESCE(charge_amount, price)) AS turnover_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<?
+        WHERE charge_chat_id IS NOT NULL AND {date_expr}>=? AND {date_expr}<?
         GROUP BY operator_key
         ORDER BY total DESC, operator_key ASC
         """,
@@ -1874,14 +1886,14 @@ def render_group_stats_panel() -> str:
     ).fetchall()
 
     per_taker = db.conn.execute(
-        """
+        f"""
         SELECT
             taken_by_admin AS taker_user_id,
             COUNT(*) AS total,
             SUM(COALESCE(charge_amount, price)) AS turnover_total,
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_total
         FROM queue_items
-        WHERE work_chat_id IS NOT NULL AND taken_at>=? AND taken_at<? AND taken_by_admin IS NOT NULL
+        WHERE charge_chat_id IS NOT NULL AND {date_expr}>=? AND {date_expr}<? AND taken_by_admin IS NOT NULL
         GROUP BY taken_by_admin
         ORDER BY total DESC
         """,
@@ -2531,6 +2543,14 @@ def touch_user(user_id: int, username: str, full_name: str):
 
 
 def bot_username_for_ref() -> str:
+    try:
+        if PRIMARY_BOT is not None:
+            cached_me = getattr(PRIMARY_BOT, "_me", None)
+            uname = getattr(cached_me, "username", None)
+            if uname:
+                return uname
+    except Exception:
+        pass
     return db.get_setting('bot_username_cached', BOT_USERNAME_FALLBACK) or BOT_USERNAME_FALLBACK
 
 
@@ -3648,14 +3668,17 @@ async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     _, _, chat_id, thread_id = callback.data.split(":")
+    chat_id = int(chat_id)
     thread = None if int(thread_id) == 0 else int(thread_id)
-    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
-    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
-    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    thread_key = db._thread_key(thread)
+    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
     db.conn.commit()
+    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s", chat_id, thread_key, callback.from_user.id)
     await state.clear()
-    await safe_edit_or_send(callback, "✅ Группа/топик убраны из админ-списка.", reply_markup=admin_back_kb("admin:group_stats_panel"))
-    await callback.answer()
+    await safe_edit_or_send(callback, "<b>✅ Группа удалена из статистики</b>\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
+    await callback.answer("Удалено")
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery):
@@ -3794,6 +3817,46 @@ async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_ad_text)
     await callback.message.answer(
         "Отправьте текст рассылки.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:set_operator_emoji")
+async def admin_set_operator_emoji_panel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await safe_edit_or_send(
+        callback,
+        "<b>💎 Эмодзи операторов</b>\n\nВыберите оператора. После этого отправьте <b>premium emoji</b>, <b>стикер</b> с ним, <b>ID</b> или <code>skip</code>, чтобы убрать premium emoji.",
+        reply_markup=operator_emoji_pick_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:pick_operator_emoji:"))
+async def admin_pick_operator_emoji(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    key = callback.data.split(":", 2)[-1].strip().lower()
+    if key not in OPERATORS:
+        await callback.answer("Оператор не найден", show_alert=True)
+        return
+    current_emoji_id, current_fallback = CUSTOM_OPERATOR_EMOJI.get(key, ("", "📱"))
+    await state.update_data(new_operator_payload={
+        'key': key,
+        'title': OPERATORS[key].get('title', key),
+        'price': float(OPERATORS[key].get('price', 0) or 0),
+        'command': OPERATORS[key].get('command', f'/{key}'),
+        'emoji': current_fallback or '📱',
+        'emoji_id': current_emoji_id or '',
+        'edit_existing_operator_emoji': True,
+    })
+    await state.set_state(AdminStates.waiting_new_operator_emoji)
+    await safe_edit_or_send(
+        callback,
+        f"<b>💎 Эмодзи для оператора</b>\n\nОператор: <b>{escape(OPERATORS[key].get('title', key))}</b>\nТекущий emoji_id: <code>{escape(current_emoji_id or 'нет')}</code>\n\nОтправьте <b>premium emoji</b>, <b>стикер</b> с ним или просто <b>ID</b>.\nОтправьте <code>skip</code>, чтобы убрать premium emoji и оставить обычный смайл.",
+        reply_markup=admin_back_kb("admin:set_operator_emoji"),
     )
     await callback.answer()
 
@@ -3992,18 +4055,19 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
             item.update(item_payload)
             updated = True
             break
-    if not updated and key not in OPERATORS:
+
+    is_base = key in base_keys
+    if not is_base and not updated:
         extra_items.append(item_payload)
-    elif key in OPERATORS and key not in base_keys:
-        if not updated:
-            extra_items.append(item_payload)
-    elif key in base_keys:
+
+    if key in OPERATORS:
         OPERATORS[key]['title'] = title
         OPERATORS[key]['price'] = price
         OPERATORS[key]['command'] = command
+    else:
+        OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
     db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
-    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
@@ -4011,8 +4075,9 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
     CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
     await state.clear()
-    suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • без premium emoji"
-    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key}){suffix}", reply_markup=admin_root_kb())
+    suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
+    result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
+    await message.answer(f"{result_text}: <b>{escape(title)}</b> ({key}){suffix}", reply_markup=admin_root_kb())
 @router.message(AdminStates.waiting_remove_operator)
 async def admin_remove_operator_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -5031,14 +5096,17 @@ async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     _, _, chat_id, thread_id = callback.data.split(":")
+    chat_id = int(chat_id)
     thread = None if int(thread_id) == 0 else int(thread_id)
-    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
-    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
-    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (int(chat_id), db._thread_key(thread)))
+    thread_key = db._thread_key(thread)
+    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
     db.conn.commit()
+    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s", chat_id, thread_key, callback.from_user.id)
     await state.clear()
-    await safe_edit_or_send(callback, "✅ Группа/топик убраны из админ-списка.", reply_markup=admin_back_kb("admin:group_stats_panel"))
-    await callback.answer()
+    await safe_edit_or_send(callback, "<b>✅ Группа удалена из статистики</b>\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
+    await callback.answer("Удалено")
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery):
@@ -5375,18 +5443,19 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
             item.update(item_payload)
             updated = True
             break
-    if not updated and key not in OPERATORS:
+
+    is_base = key in base_keys
+    if not is_base and not updated:
         extra_items.append(item_payload)
-    elif key in OPERATORS and key not in base_keys:
-        if not updated:
-            extra_items.append(item_payload)
-    elif key in base_keys:
+
+    if key in OPERATORS:
         OPERATORS[key]['title'] = title
         OPERATORS[key]['price'] = price
         OPERATORS[key]['command'] = command
+    else:
+        OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
     db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
-    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
@@ -5394,8 +5463,9 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
     CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
     await state.clear()
-    suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • без premium emoji"
-    await message.answer(f"✅ Оператор сохранён: <b>{escape(title)}</b> ({key}){suffix}", reply_markup=admin_root_kb())
+    suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
+    result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
+    await message.answer(f"{result_text}: <b>{escape(title)}</b> ({key}){suffix}", reply_markup=admin_root_kb())
 
 
 @router.message(AdminStates.waiting_remove_operator)
