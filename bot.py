@@ -35,7 +35,7 @@ BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = [626387429]
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
@@ -164,6 +164,7 @@ class AdminStates(StatesGroup):
     waiting_new_operator_emoji = State()
     waiting_remove_operator = State()
     waiting_remove_group = State()
+    waiting_summary_date = State()
 
 
 @dataclass
@@ -819,7 +820,7 @@ class Database:
             return False
         cur = self.conn.cursor()
         cur.execute(
-            "UPDATE queue_items SET status='taken', taken_by_admin=?, taken_at=?, charge_chat_id=?, charge_thread_id=?, charge_amount=? WHERE id=? AND status='queued'",
+            "UPDATE queue_items SET status='taken', taken_by_admin=?, taken_at=?, charge_chat_id=?, charge_thread_id=?, charge_amount=?, charge_refunded=0 WHERE id=? AND status='queued'",
             (taker_id, now_str(), int(chat_id), self._thread_key(thread_id), float(amount), item_id),
         )
         if cur.rowcount <= 0:
@@ -833,13 +834,15 @@ class Database:
         return True
 
     def release_item_reservation(self, item_id: int) -> float:
-        row = self.conn.execute("SELECT charge_chat_id, charge_thread_id, charge_amount FROM queue_items WHERE id=?", (item_id,)).fetchone()
+        row = self.conn.execute("SELECT charge_chat_id, charge_thread_id, charge_amount, COALESCE(charge_refunded, 0) AS charge_refunded FROM queue_items WHERE id=?", (item_id,)).fetchone()
         if not row or row["charge_chat_id"] is None or row["charge_amount"] is None:
+            return 0.0
+        if int(row["charge_refunded"] or 0) == 1:
             return 0.0
         amount = float(row["charge_amount"] or 0)
         thread_id = None if int(row["charge_thread_id"]) == -1 else int(row["charge_thread_id"])
         self.add_group_balance(int(row["charge_chat_id"]), thread_id, amount)
-        self.conn.execute("UPDATE queue_items SET charge_chat_id=NULL, charge_thread_id=NULL, charge_amount=NULL WHERE id=?", (item_id,))
+        self.conn.execute("UPDATE queue_items SET charge_refunded=1 WHERE id=?", (item_id,))
         self.conn.commit()
         return amount
 
@@ -1393,6 +1396,34 @@ def cancel_inline_kb(target: str = "admin:user_tools"):
     kb.adjust(1)
     return kb.as_markup()
 
+def workspace_display_title(chat_id: int, thread_id: int | None = None, chat_title: str | None = None, thread_title: str | None = None) -> str:
+    base_title = (chat_title or '').strip()
+    if not base_title:
+        row = db.conn.execute("SELECT chat_title, thread_title FROM workspaces WHERE chat_id=? AND thread_id=? AND is_enabled=1 ORDER BY id DESC LIMIT 1", (int(chat_id), db._thread_key(thread_id))).fetchone()
+        if row:
+            if not base_title:
+                base_title = (row['chat_title'] or '').strip()
+            if not thread_title:
+                thread_title = (row['thread_title'] or '').strip()
+    if not base_title:
+        base_title = str(chat_id)
+    if thread_id:
+        suffix = (thread_title or '').strip() or f"topic {thread_id}"
+        return f"{base_title} / {suffix}"
+    return base_title
+
+
+def set_workspace_title(chat_id: int, thread_id: int | None, chat_title: str | None = None, thread_title: str | None = None):
+    try:
+        db.conn.execute(
+            "UPDATE workspaces SET chat_title=COALESCE(?, chat_title), thread_title=COALESCE(?, thread_title) WHERE chat_id=? AND thread_id=?",
+            (chat_title, thread_title, int(chat_id), db._thread_key(thread_id)),
+        )
+        db.conn.commit()
+    except Exception:
+        logging.exception("set_workspace_title failed chat_id=%s thread_id=%s", chat_id, thread_id)
+
+
 def group_stats_list_kb():
     kb = InlineKeyboardBuilder()
     seen = set()
@@ -1400,21 +1431,19 @@ def group_stats_list_kb():
         rows = db.list_workspaces()
     except Exception:
         rows = db.conn.execute(
-            "SELECT chat_id, thread_id, mode FROM workspaces WHERE is_enabled=1 ORDER BY chat_id DESC, thread_id DESC"
+            "SELECT chat_id, thread_id, mode, chat_title, thread_title FROM workspaces WHERE is_enabled=1 ORDER BY chat_id DESC, thread_id DESC"
         ).fetchall()
 
     for row in rows:
         chat_id = int(row["chat_id"])
         raw_thread = row["thread_id"]
         thread_id = None if raw_thread in (None, -1) else int(raw_thread)
-        mode = row["mode"] if "mode" in row.keys() else None
         key = (chat_id, thread_id)
         if key in seen:
             continue
         seen.add(key)
-        prefix = "⏳ " if mode == "hold" else ("⚡ " if mode == "no_hold" else "💬 ")
-        label = f"{prefix}{chat_id}" + (f" / topic {thread_id}" if thread_id else "")
-        kb.button(text=label[:52], callback_data=f"admin:groupstat:{chat_id}:{thread_id or 0}")
+        title = workspace_display_title(chat_id, thread_id, row["chat_title"] if "chat_title" in row.keys() else None, row["thread_title"] if "thread_title" in row.keys() else None)
+        kb.button(text=(f"💬 {title}")[:52], callback_data=f"admin:groupstat:{chat_id}:{thread_id or 0}")
         kb.button(text="🗑 Удалить", callback_data=f"admin:group_remove:{chat_id}:{thread_id or 0}")
 
     if not seen:
@@ -1532,10 +1561,10 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
     if not taker_lines:
         taker_lines = ["• Пока никто не брал номера"]
 
-    where_label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
+    where_label = escape(workspace_display_title(chat_id, thread_id))
     return (
         "<b>📈 Статистика группы за сегодня</b>\n\n"
-        f"💬 Группа: {where_label}\n"
+        f"💬 Группа: <b>{where_label}</b>\n"
         f"🗓 День: <b>{day_label}</b>\n"
         f"♻️ {msk_stats_reset_note()}\n\n"
         f"📦 Взято всего: <b>{int(totals['taken_total'] or 0)}</b>\n"
@@ -1811,12 +1840,12 @@ def render_withdraw_setup() -> str:
     )
 
 def render_my_numbers(user_id: int) -> str:
-    items = user_today_queue_items(user_id)
+    items = user_active_queue_items(user_id)
     if not items:
-        body = "• За сегодня заявок пока нет."
+        body = "• Активных заявок пока нет."
     else:
         rows = []
-        for row in items[:10]:
+        for row in items[:15]:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
             rows.append(
@@ -1825,9 +1854,9 @@ def render_my_numbers(user_id: int) -> str:
             )
         body = "\n".join(rows)
     return (
-        "<b>📦 Мои номера — сегодня</b>\n\n"
+        "<b>📦 Мои номера — активные</b>\n\n"
         + quote_block([body])
-        + "\n\n<i>Здесь можно посмотреть свои заявки за день и убрать из очереди те, что ещё не взяты в работу.</i>"
+        + "\n\n<i>Здесь видны номера, которые ещё стоят в очереди, взяты или в работе. Они не пропадают в 00:00, пока вы сами их не уберёте или их не обработают.</i>"
     )
 
 def render_mirror_menu(user_id: int) -> str:
@@ -1952,7 +1981,36 @@ def render_admin_home() -> str:
     )
 
 
-def render_admin_summary() -> str:
+def summary_stats_for_period(day_start: str, day_end: str):
+    date_expr = "COALESCE(completed_at, work_started_at, taken_at, created_at)"
+    submitted = db.conn.execute(
+        "SELECT COUNT(*) AS submitted_total FROM queue_items WHERE created_at>=? AND created_at<?",
+        (day_start, day_end),
+    ).fetchone()
+    actions = db.conn.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
+            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
+            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
+        FROM queue_items
+        WHERE {date_expr}>=? AND {date_expr}<?
+        """,
+        (day_start, day_end),
+    ).fetchone()
+    return {
+        'submitted_total': int((submitted['submitted_total'] if submitted else 0) or 0),
+        'taken_total': int((actions['taken_total'] if actions else 0) or 0),
+        'paid_total': int((actions['paid_total'] if actions else 0) or 0),
+        'slips_total': int((actions['slips_total'] if actions else 0) or 0),
+        'errors_total': int((actions['errors_total'] if actions else 0) or 0),
+        'margin_total': float((actions['margin_total'] if actions else 0) or 0),
+    }
+
+
+def render_admin_summary_for_date(day_start: str, day_end: str, day_label: str) -> str:
     totals = db.conn.execute(
         """
         SELECT
@@ -1965,21 +2023,7 @@ def render_admin_summary() -> str:
         FROM queue_items
         """
     ).fetchone()
-    day_start, day_end, day_label = msk_today_bounds_str()
-    daily = db.conn.execute(
-        """
-        SELECT
-            COUNT(*) AS submitted_total,
-            SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
-            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
-            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
-            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
-        FROM queue_items
-        WHERE created_at>=? AND created_at<?
-        """,
-        (day_start, day_end),
-    ).fetchone()
+    daily = summary_stats_for_period(day_start, day_end)
     lines = []
     for key, data in OPERATORS.items():
         lines.append(f"• {op_text(key)}: {db.count_waiting(key)}")
@@ -1991,15 +2035,28 @@ def render_admin_summary() -> str:
         f"❌ Слеты: <b>{int(totals['slips_total'] or 0)}</b>\n"
         f"⚠️ Ошибки: <b>{int(totals['errors_total'] or 0)}</b>\n"
         f"📈 Маржа: <b>{usd(totals['margin_total'] or 0)}</b>\n\n"
-        f"<b>🗓 Ежедневная сводка — {day_label}</b>\n"
-        f"📥 Сдано: <b>{int(daily['submitted_total'] or 0)}</b> • "
-        f"🙋 Взято: <b>{int(daily['taken_total'] or 0)}</b> • "
-        f"✅ Оплачено: <b>{int(daily['paid_total'] or 0)}</b>\n"
-        f"❌ Слеты: <b>{int(daily['slips_total'] or 0)}</b> • "
-        f"⚠️ Ошибки: <b>{int(daily['errors_total'] or 0)}</b> • "
-        f"📈 Маржа: <b>{usd(daily['margin_total'] or 0)}</b>\n\n"
+        f"<b>🗓 Отчет за дату — {day_label}</b>\n"
+        f"📥 Сдано: <b>{daily['submitted_total']}</b> • "
+        f"🙋 Взято: <b>{daily['taken_total']}</b> • "
+        f"✅ Оплачено: <b>{daily['paid_total']}</b>\n"
+        f"❌ Слеты: <b>{daily['slips_total']}</b> • "
+        f"⚠️ Ошибки: <b>{daily['errors_total']}</b> • "
+        f"📈 Маржа: <b>{usd(daily['margin_total'])}</b>\n\n"
         "<b>📦 Очередь по операторам</b>\n" + "\n".join(lines)
     )
+
+
+def render_admin_summary() -> str:
+    day_start, day_end, day_label = msk_today_bounds_str()
+    return render_admin_summary_for_date(day_start, day_end, day_label)
+
+
+def admin_summary_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Отчет по дате", callback_data="admin:summary_by_date")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def render_admin_treasury() -> str:
@@ -2259,6 +2316,12 @@ def ensure_extra_schema():
         cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_chat_id INTEGER")
     if 'user_hold_message_id' not in qi_cols:
         cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_message_id INTEGER")
+    if 'charge_refunded' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN charge_refunded INTEGER NOT NULL DEFAULT 0")
+    if 'chat_title' not in ws_cols:
+        cur.execute("ALTER TABLE workspaces ADD COLUMN chat_title TEXT")
+    if 'thread_title' not in ws_cols:
+        cur.execute("ALTER TABLE workspaces ADD COLUMN thread_title TEXT")
     if 'payout_check_id' not in wd_cols:
         cur.execute("ALTER TABLE withdrawals ADD COLUMN payout_check_id INTEGER")
     defaults = {
@@ -2614,6 +2677,13 @@ def user_today_queue_items(user_id: int):
     return db.conn.execute(
         "SELECT * FROM queue_items WHERE user_id=? AND created_at >= ? AND created_at < ? ORDER BY id DESC",
         (user_id, start, end),
+    ).fetchall()
+
+
+def user_active_queue_items(user_id: int):
+    return db.conn.execute(
+        "SELECT * FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress') ORDER BY id DESC",
+        (user_id,),
     ).fetchall()
 
 
@@ -3066,7 +3136,7 @@ async def menu_my(callback: CallbackQuery, state: FSMContext):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
         await callback.answer()
         return
-    items = user_today_queue_items(callback.from_user.id)
+    items = user_active_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
     await callback.answer()
 
@@ -3606,7 +3676,16 @@ async def admin_home(callback: CallbackQuery, state: FSMContext):
 async def admin_summary(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_admin_summary(), reply_markup=admin_back_kb())
+    await callback.message.edit_text(render_admin_summary(), reply_markup=admin_summary_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:summary_by_date")
+async def admin_summary_by_date(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_summary_date)
+    await callback.message.answer("📅 Введите дату в формате <code>ДД-ММ-ГГГГ</code> или <code>ДД.ММ.ГГГГ</code>.")
     await callback.answer()
 
 
@@ -3703,14 +3782,21 @@ async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
     _, _, chat_id, thread_id = callback.data.split(":")
     chat_id = int(chat_id)
     thread = None if int(thread_id) == 0 else int(thread_id)
-    thread_key = db._thread_key(thread)
-    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
-    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
-    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    title = workspace_display_title(chat_id, thread)
+    if thread is None:
+        db.conn.execute("DELETE FROM workspaces WHERE chat_id=?", (chat_id,))
+        db.conn.execute("DELETE FROM group_finance WHERE chat_id=?", (chat_id,))
+        db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=?", (chat_id,))
+    else:
+        thread_key = db._thread_key(thread)
+        db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+        db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+        db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
     db.conn.commit()
-    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s", chat_id, thread_key, callback.from_user.id)
+    left = db.conn.execute("SELECT COUNT(*) AS c FROM workspaces WHERE chat_id=?", (chat_id,)).fetchone()
+    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s title=%s left=%s", chat_id, db._thread_key(thread), callback.from_user.id, title, int((left['c'] if left else 0) or 0))
     await state.clear()
-    await safe_edit_or_send(callback, "<b>✅ Группа удалена из статистики</b>\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
+    await safe_edit_or_send(callback, f"<b>✅ Удалено:</b> {escape(title)}\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
     await callback.answer("Удалено")
 
 @router.callback_query(F.data == "admin:settings")
@@ -4144,6 +4230,28 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
 
+@router.message(AdminStates.waiting_summary_date)
+async def admin_summary_date_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or '').strip()
+    m = re.fullmatch(r"(\d{2})[-.](\d{2})[-.](\d{4})", raw)
+    if not m:
+        await message.answer("⚠️ Формат даты: <code>01-04-2026</code>")
+        return
+    dd, mm, yyyy = map(int, m.groups())
+    try:
+        dt = datetime(yyyy, mm, dd)
+    except Exception:
+        await message.answer("⚠️ Такой даты не существует.")
+        return
+    start = dt.strftime("%Y-%m-%d 00:00:00")
+    end = (dt + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    label = dt.strftime("%d.%m.%Y")
+    await state.clear()
+    await message.answer(render_admin_summary_for_date(start, end, label), reply_markup=admin_summary_kb())
+
+
 @router.message(AdminStates.waiting_hold)
 async def admin_hold_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -4347,6 +4455,9 @@ async def enable_work_group(message: Message):
                 logging.info("/work auto-enabled current topic chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             after_rows = debug_workspace_rows(message.chat.id)
             logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            set_workspace_title(message.chat.id, None, getattr(message.chat, 'title', None), None)
+            if thread_id:
+                set_workspace_title(message.chat.id, thread_id, getattr(message.chat, 'title', None), None)
             await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
     except Exception:
         logging.exception("/work failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
@@ -4388,6 +4499,7 @@ async def enable_work_topic(message: Message):
             await message.answer("🛑 Работа в этом топике выключена.")
         else:
             db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+            set_workspace_title(message.chat.id, thread_id, getattr(message.chat, 'title', None), None)
             logging.info("/topic enabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             await message.answer("✅ Этот топик добавлен как рабочий.")
     except Exception:
@@ -5055,7 +5167,16 @@ async def admin_home(callback: CallbackQuery, state: FSMContext):
 async def admin_summary(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.message.edit_text(render_admin_summary(), reply_markup=admin_back_kb())
+    await callback.message.edit_text(render_admin_summary(), reply_markup=admin_summary_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:summary_by_date")
+async def admin_summary_by_date(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_summary_date)
+    await callback.message.answer("📅 Введите дату в формате <code>ДД-ММ-ГГГГ</code> или <code>ДД.ММ.ГГГГ</code>.")
     await callback.answer()
 
 
@@ -5152,14 +5273,21 @@ async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
     _, _, chat_id, thread_id = callback.data.split(":")
     chat_id = int(chat_id)
     thread = None if int(thread_id) == 0 else int(thread_id)
-    thread_key = db._thread_key(thread)
-    db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
-    db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
-    db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+    title = workspace_display_title(chat_id, thread)
+    if thread is None:
+        db.conn.execute("DELETE FROM workspaces WHERE chat_id=?", (chat_id,))
+        db.conn.execute("DELETE FROM group_finance WHERE chat_id=?", (chat_id,))
+        db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=?", (chat_id,))
+    else:
+        thread_key = db._thread_key(thread)
+        db.conn.execute("DELETE FROM workspaces WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+        db.conn.execute("DELETE FROM group_finance WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
+        db.conn.execute("DELETE FROM group_operator_prices WHERE chat_id=? AND thread_id=?", (chat_id, thread_key))
     db.conn.commit()
-    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s", chat_id, thread_key, callback.from_user.id)
+    left = db.conn.execute("SELECT COUNT(*) AS c FROM workspaces WHERE chat_id=?", (chat_id,)).fetchone()
+    logging.info("admin_group_remove chat_id=%s thread_id=%s by user_id=%s title=%s left=%s", chat_id, db._thread_key(thread), callback.from_user.id, title, int((left['c'] if left else 0) or 0))
     await state.clear()
-    await safe_edit_or_send(callback, "<b>✅ Группа удалена из статистики</b>\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
+    await safe_edit_or_send(callback, f"<b>✅ Удалено:</b> {escape(title)}\n\nВыберите следующую группу / топик:", reply_markup=group_stats_list_kb())
     await callback.answer("Удалено")
 
 @router.callback_query(F.data == "admin:settings")
@@ -5555,6 +5683,28 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
 
+@router.message(AdminStates.waiting_summary_date)
+async def admin_summary_date_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or '').strip()
+    m = re.fullmatch(r"(\d{2})[-.](\d{2})[-.](\d{4})", raw)
+    if not m:
+        await message.answer("⚠️ Формат даты: <code>01-04-2026</code>")
+        return
+    dd, mm, yyyy = map(int, m.groups())
+    try:
+        dt = datetime(yyyy, mm, dd)
+    except Exception:
+        await message.answer("⚠️ Такой даты не существует.")
+        return
+    start = dt.strftime("%Y-%m-%d 00:00:00")
+    end = (dt + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    label = dt.strftime("%d.%m.%Y")
+    await state.clear()
+    await message.answer(render_admin_summary_for_date(start, end, label), reply_markup=admin_summary_kb())
+
+
 @router.message(AdminStates.waiting_hold)
 async def admin_hold_value(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -5758,6 +5908,9 @@ async def enable_work_group(message: Message):
                 logging.info("/work auto-enabled current topic chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             after_rows = debug_workspace_rows(message.chat.id)
             logging.info("/work enabled chat_id=%s by user_id=%s after_rows=%s", message.chat.id, message.from_user.id, after_rows)
+            set_workspace_title(message.chat.id, None, getattr(message.chat, 'title', None), None)
+            if thread_id:
+                set_workspace_title(message.chat.id, thread_id, getattr(message.chat, 'title', None), None)
             await message.answer("✅ Эта группа добавлена как рабочая. Операторы и админы теперь могут брать здесь номера.")
     except Exception:
         logging.exception("/work failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
@@ -5799,6 +5952,7 @@ async def enable_work_topic(message: Message):
             await message.answer("🛑 Работа в этом топике выключена.")
         else:
             db.enable_workspace(message.chat.id, thread_id, "topic", message.from_user.id)
+            set_workspace_title(message.chat.id, thread_id, getattr(message.chat, 'title', None), None)
             logging.info("/topic enabled chat_id=%s thread_id=%s by user_id=%s", message.chat.id, thread_id, message.from_user.id)
             await message.answer("✅ Этот топик добавлен как рабочий.")
     except Exception:
@@ -6474,7 +6628,7 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Убрать можно только номер из очереди", show_alert=True)
         return
     remove_queue_item(item_id, reason='user_removed')
-    items = user_today_queue_items(callback.from_user.id)
+    items = user_active_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
     await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{item_id}</b>")
     await callback.answer("Номер убран")
