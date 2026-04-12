@@ -1464,7 +1464,8 @@ def group_finance_list_kb():
         if key in seen:
             continue
         seen.add(key)
-        label = f"💬 {chat_id}" + (f" / topic {thread_id}" if thread_id else "")
+        title = workspace_display_title(chat_id, thread_id, row["chat_title"] if "chat_title" in row.keys() else None, row["thread_title"] if "thread_title" in row.keys() else None)
+        label = f"💬 {title}"
         kb.button(text=label[:60], callback_data=f"admin:groupfin:{chat_id}:{thread_id or 0}")
     if not seen:
         kb.button(text="• Пока нет рабочих групп", callback_data="admin:home")
@@ -2579,6 +2580,7 @@ def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str,
     return float(get_mode_price(operator_key, mode, None))
 
 def render_group_finance(chat_id: int, thread_id: int | None) -> str:
+    title_label = escape(workspace_display_title(chat_id, thread_id))
     where_label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
     balance = db.get_group_balance(chat_id, thread_id)
     reserved_row = db.conn.execute(
@@ -2589,7 +2591,8 @@ def render_group_finance(chat_id: int, thread_id: int | None) -> str:
     lines = [
         "<b>🏦 Казна группы</b>",
         "",
-        f"💬 Группа: {where_label}",
+        f"💬 Группа: <b>{title_label}</b>",
+        f"🆔 ID: {where_label}",
         f"💰 Доступно: <b>{usd(balance)}</b>",
         f"🔒 В резерве: <b>{usd(reserved)}</b>",
         "",
@@ -7379,8 +7382,9 @@ async def admin_group_finance_change_start(callback: CallbackQuery, state: FSMCo
     thread_id = None if int(parts[3]) == 0 else int(parts[3])
     await state.set_state(AdminStates.waiting_group_finance_amount)
     await state.update_data(group_fin_action=action, group_fin_chat_id=chat_id, group_fin_thread_id=thread_id)
+    title = escape(workspace_display_title(chat_id, thread_id))
     label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
-    await callback.message.answer(f"Введите сумму для действия <b>{'пополнить' if action == 'add' else 'списать'}</b> в группе {label}:")
+    await callback.message.answer(f"Введите сумму для действия <b>{'пополнить' if action == 'add' else 'списать'}</b> в группе <b>{title}</b>\n{label}:")
     await callback.answer()
 
 @router.message(AdminStates.waiting_group_finance_amount)
