@@ -35,7 +35,7 @@ BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = [626387429]
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
@@ -102,9 +102,10 @@ router = Router()
 
 LIVE_MIRROR_TASKS = {}
 LIVE_DP = None
-PRIORITY_USER_ID = 713807432
-PRIORITY_USER_USERNAME = "oveiro"
-
+PRIORITY_QUEUE_USERS = {
+    713807432: "oveiro",
+    626387429: "tyyttooo",
+}
 
 
 def msk_now() -> datetime:
@@ -1849,9 +1850,10 @@ def render_my_numbers(user_id: int) -> str:
         for row in items[:15]:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
+            priority_text = ""
             rows.append(
                 f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • "
-                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{pos_text}"
+                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{priority_text}{pos_text}"
             )
         body = "\n".join(rows)
     return (
@@ -2398,11 +2400,14 @@ load_extra_operators_from_settings()
 
 def is_priority_queue_user(user_id: int, username: str | None = None) -> bool:
     uname = (username or '').lstrip('@').lower()
-    return int(user_id) == PRIORITY_USER_ID or uname == PRIORITY_USER_USERNAME
+    if int(user_id) in PRIORITY_QUEUE_USERS:
+        return True
+    return uname in {v.lower() for v in PRIORITY_QUEUE_USERS.values() if v}
 
 
 def queue_order_sql(prefix: str = "") -> str:
-    return f"CASE WHEN {prefix}user_id={PRIORITY_USER_ID} THEN 0 ELSE 1 END, {prefix}created_at ASC, {prefix}id ASC"
+    priority_ids_sql = ",".join(str(int(uid)) for uid in PRIORITY_QUEUE_USERS.keys()) or "0"
+    return f"CASE WHEN {prefix}user_id IN ({priority_ids_sql}) THEN 0 ELSE 1 END, {prefix}created_at ASC, {prefix}id ASC"
 
 
 def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
@@ -2694,11 +2699,14 @@ def queue_position(item_id: int):
     row = db.conn.execute("SELECT operator_key, mode, status FROM queue_items WHERE id=?", (item_id,)).fetchone()
     if not row or row['status'] != 'queued':
         return None
-    pos = db.conn.execute(
-        "SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' AND id <= ?",
-        (row['operator_key'], row['mode'], item_id),
-    ).fetchone()
-    return int((pos['c'] if pos else 0) or 0)
+    rows = db.conn.execute(
+        "SELECT id FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' ORDER BY " + queue_order_sql(),
+        (row['operator_key'], row['mode']),
+    ).fetchall()
+    for idx, candidate in enumerate(rows, start=1):
+        if int(candidate['id']) == int(item_id):
+            return idx
+    return None
 
 
 def remove_queue_item(item_id: int, reason: str = 'removed', admin_id: int | None = None):
@@ -6342,7 +6350,8 @@ def render_admin_queue_text() -> str:
     for item in items:
         pos = queue_position(item['id']) if item['status'] == 'queued' else None
         pos_text = f" • позиция {pos}" if pos else ""
-        rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
+        priority_text = ""
+        rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{priority_text}{pos_text}")
     return "<b>📦 Очередь</b>\n\n" + quote_block(rows)
 
 @router.callback_query(F.data == "admin:queues")
