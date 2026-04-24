@@ -35,7 +35,7 @@ BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = [626387429]
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
@@ -1674,11 +1674,9 @@ def escape(value: Optional[str]) -> str:
 
 
 def queue_caption(item: QueueItem) -> str:
-    display_price = getattr(item, 'charge_amount', None)
-    if display_price in (None, 0, 0.0):
-        charge_chat_id = getattr(item, 'charge_chat_id', None)
-        if charge_chat_id:
-            display_price = group_price_for_take(charge_chat_id, getattr(item, 'charge_thread_id', None), item.operator_key, item.mode)
+    # В карточке заявки показываем именно прайс сдачи из бота,
+    # сохранённый в queue_items.price на момент загрузки номера.
+    submit_price = getattr(item, 'price', None)
     text = (
         f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
@@ -1687,8 +1685,8 @@ def queue_caption(item: QueueItem) -> str:
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
-    if display_price not in (None, 0, 0.0):
-        text += f"\n🏷 Прайс группы: <b>{usd(float(display_price))}</b>"
+    if submit_price not in (None, 0, 0.0):
+        text += f"\n🏷 Прайс сдачи: <b>{usd(float(submit_price))}</b>"
     if item.status == "in_progress":
         text += "\n\n🚀 <b>Работа началась</b>"
         if item.mode == "hold":
