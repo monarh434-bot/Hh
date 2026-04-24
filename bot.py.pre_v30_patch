@@ -3,7 +3,6 @@ import html
 import io
 import json
 import logging
-import math
 import re
 import sqlite3
 import shutil
@@ -36,7 +35,7 @@ BOT_USERNAME_FALLBACK = "esimservicexbot"
 
 # Roles
 CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = [626387429]
+BOOTSTRAP_ADMINS = [123456789]
 BOOTSTRAP_OPERATORS = []
 
 WITHDRAW_CHANNEL_ID = -1003785698154
@@ -201,7 +200,6 @@ class QueueItem:
     charge_amount: Optional[float] = None
     user_hold_chat_id: Optional[int] = None
     user_hold_message_id: Optional[int] = None
-    referral_bonus: Optional[float] = 0.0
 
     @classmethod
     def from_row(cls, row):
@@ -380,22 +378,6 @@ class Database:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS operators_store (
-                key TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                price REAL NOT NULL DEFAULT 0,
-                command TEXT NOT NULL,
-                emoji_id TEXT,
-                emoji TEXT,
-                is_base INTEGER NOT NULL DEFAULT 0,
-                is_enabled INTEGER NOT NULL DEFAULT 1,
-                updated_at TEXT NOT NULL
             )
             """
         )
@@ -951,7 +933,7 @@ class Database:
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
                 SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
                 SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total
+                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
             FROM queue_items
             WHERE charge_chat_id=? AND charge_thread_id=?
             """,
@@ -1245,22 +1227,12 @@ def profile_kb():
     kb.adjust(1)
     return kb.as_markup()
 
-def my_numbers_kb(user_id: int, page: int = 0):
-    total = user_active_queue_count(user_id)
-    pages = max(1, math.ceil(total / MY_NUMBERS_PAGE_SIZE))
-    page = max(0, min(int(page or 0), pages - 1))
-    items = user_active_queue_items(user_id, MY_NUMBERS_PAGE_SIZE, page * MY_NUMBERS_PAGE_SIZE)
+def my_numbers_kb(items):
     kb = InlineKeyboardBuilder()
-    for item in items:
+    for item in items[:10]:
         if item['status'] == 'queued':
-            kb.button(text=f"🗑 Убрать #{item['id']}", callback_data=f"myremove:{item['id']}:{page}")
-    if pages > 1:
-        if page > 0:
-            kb.button(text="⬅️ Назад", callback_data=f"menu:my:{page-1}")
-        kb.button(text=f"📄 {page+1}/{pages}", callback_data="noop")
-        if page < pages - 1:
-            kb.button(text="➡️ Далее", callback_data=f"menu:my:{page+1}")
-    kb.button(text="↻ Обновить", callback_data=f"menu:my:{page}")
+            kb.button(text=f"🗑 Убрать #{item['id']}", callback_data=f"myremove:{item['id']}")
+    kb.button(text="↻ Обновить", callback_data="menu:my")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -1530,7 +1502,7 @@ def render_single_group_stats(chat_id: int, thread_id: int | None) -> str:
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
             SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
         WHERE charge_chat_id=? AND charge_thread_id=? AND {date_expr}>=? AND {date_expr}<?
         """,
@@ -1709,6 +1681,7 @@ def queue_caption(item: QueueItem) -> str:
         f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
         f"👤 От: <b>{escape(item.full_name)}</b>\n"
+        f"🆔 ID: <code>{item.user_id}</code>\n"
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
@@ -1803,7 +1776,6 @@ def render_profile(user_id: int) -> str:
     except Exception:
         ref_count = 0
     ref_earned = float((user['ref_earned'] if user and 'ref_earned' in user.keys() else 0) or 0)
-    today_stats = user_daily_submit_stats(user_id)
     ops_text = "\n".join(
         f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
         for row in ops
@@ -1831,14 +1803,6 @@ def render_profile(user_id: int) -> str:
             f"⚠️ <b>Ошибки:</b> {int(stats['errors'] or 0)}",
             f"💰 <b>Всего заработано:</b> <b>{usd(stats['earned'] or 0)}</b>",
             f"📤 <b>Сейчас в очередях:</b> {current_queue}",
-        ])
-        + "\n\n<b>📅 Сегодня поставлено:</b>\n"
-        + quote_block([
-            f"📥 <b>Всего:</b> {int((today_stats['total'] if today_stats else 0) or 0)}",
-            f"✅ <b>Успешно:</b> {int((today_stats['completed'] if today_stats else 0) or 0)}",
-            f"❌ <b>Слеты:</b> {int((today_stats['slipped'] if today_stats else 0) or 0)}",
-            f"⚠️ <b>Ошибки:</b> {int((today_stats['errors'] if today_stats else 0) or 0)}",
-            f"💰 <b>Заработано сегодня:</b> <b>{usd((today_stats['earned'] if today_stats else 0) or 0)}</b>",
         ])
         + "\n\n<b>🎁 Реферальная система</b>\n"
         + quote_block([
@@ -1875,28 +1839,24 @@ def render_withdraw_setup() -> str:
         "👉 <b>Просто отправьте скопированную ссылку прямо мне в чат, и я её запомню.</b>"
     )
 
-def render_my_numbers(user_id: int, page: int = 0) -> str:
-    total = user_active_queue_count(user_id)
-    pages = max(1, math.ceil(total / MY_NUMBERS_PAGE_SIZE))
-    page = max(0, min(int(page or 0), pages - 1))
-    items = user_active_queue_items(user_id, MY_NUMBERS_PAGE_SIZE, page * MY_NUMBERS_PAGE_SIZE)
+def render_my_numbers(user_id: int) -> str:
+    items = user_active_queue_items(user_id)
     if not items:
         body = "• Активных заявок пока нет."
     else:
         rows = []
-        for row in items:
+        for row in items[:15]:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
+            priority_text = ""
             rows.append(
                 f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • "
-                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{pos_text}"
+                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{priority_text}{pos_text}"
             )
         body = "\n".join(rows)
-    page_line = f"\n\n📄 Страница: <b>{page+1}/{pages}</b> • всего активных: <b>{total}</b>" if total else ""
     return (
         "<b>📦 Мои номера — активные</b>\n\n"
         + quote_block([body])
-        + page_line
         + "\n\n<i>Здесь видны номера, которые ещё стоят в очереди, взяты или в работе. Они не пропадают в 00:00, пока вы сами их не уберёте или их не обработают.</i>"
     )
 
@@ -1932,7 +1892,7 @@ def render_group_stats_panel() -> str:
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
             SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS turnover_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
         WHERE charge_chat_id IS NOT NULL AND {date_expr}>=? AND {date_expr}<?
         """,
@@ -2035,7 +1995,7 @@ def summary_stats_for_period(day_start: str, day_end: str):
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
             SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
         WHERE {date_expr}>=? AND {date_expr}<?
         """,
@@ -2060,7 +2020,7 @@ def render_admin_summary_for_date(day_start: str, day_end: str, day_label: str) 
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS paid_total,
             SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips_total,
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
-            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total
+            SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
         """
     ).fetchone()
@@ -2359,27 +2319,12 @@ def ensure_extra_schema():
         cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_message_id INTEGER")
     if 'charge_refunded' not in qi_cols:
         cur.execute("ALTER TABLE queue_items ADD COLUMN charge_refunded INTEGER NOT NULL DEFAULT 0")
-    if 'referral_bonus' not in qi_cols:
-        cur.execute("ALTER TABLE queue_items ADD COLUMN referral_bonus REAL NOT NULL DEFAULT 0")
     if 'chat_title' not in ws_cols:
         cur.execute("ALTER TABLE workspaces ADD COLUMN chat_title TEXT")
     if 'thread_title' not in ws_cols:
         cur.execute("ALTER TABLE workspaces ADD COLUMN thread_title TEXT")
     if 'payout_check_id' not in wd_cols:
         cur.execute("ALTER TABLE withdrawals ADD COLUMN payout_check_id INTEGER")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS operators_store (
-            key TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            price REAL NOT NULL DEFAULT 0,
-            command TEXT NOT NULL,
-            emoji_id TEXT,
-            emoji TEXT,
-            is_base INTEGER NOT NULL DEFAULT 0,
-            is_enabled INTEGER NOT NULL DEFAULT 1,
-            updated_at TEXT NOT NULL
-        )
-    """)
     defaults = {
         'numbers_enabled': '1',
         'start_banner_path': START_BANNER,
@@ -2404,35 +2349,6 @@ def ensure_extra_schema():
 ensure_extra_schema()
 
 
-def upsert_operator_store(key: str, title: str, price: float, command: str | None = None, emoji_id: str = '', emoji: str = '📱', is_base: int = 0, is_enabled: int = 1):
-    key = re.sub(r'[^a-z0-9_]+', '', (key or '').strip().lower())
-    if not key or not title:
-        return
-    command = (command or f'/{key}').strip()
-    if not command.startswith('/'):
-        command = '/' + command
-    db.conn.execute(
-        """
-        INSERT INTO operators_store (key, title, price, command, emoji_id, emoji, is_base, is_enabled, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET
-            title=excluded.title, price=excluded.price, command=excluded.command,
-            emoji_id=excluded.emoji_id, emoji=excluded.emoji, is_base=excluded.is_base,
-            is_enabled=excluded.is_enabled, updated_at=excluded.updated_at
-        """,
-        (key, title, float(price or 0), command, emoji_id or '', emoji or '📱', int(is_base), int(is_enabled), now_str()),
-    )
-    db.conn.commit()
-
-
-def sync_operators_to_store():
-    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
-    for key, data in list(OPERATORS.items()):
-        emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(key, ('', '📱'))
-        price = float(db.get_setting(f'price_{key}', db.get_setting(f'price_hold_{key}', str(data.get('price', 0)))) or data.get('price', 0) or 0)
-        upsert_operator_store(key, data.get('title', key), price, data.get('command', f'/{key}'), emoji_id, fallback, 1 if key in base_keys else 0, 1)
-
-
 def load_extra_operators_from_settings():
     raw = db.get_setting('extra_operators_json', '[]') or '[]'
     try:
@@ -2452,45 +2368,19 @@ def load_extra_operators_from_settings():
             price = float(item.get('price', 0) or 0)
         except Exception:
             price = 0.0
-        command = str(item.get('command') or f'/{key}').strip()
         emoji_id = str(item.get('emoji_id', '') or '').strip()
-        fallback_emoji = str(item.get('emoji', '📱') or '📱')[:2] or '📱'
-        OPERATORS[key] = {'title': title, 'price': price, 'command': command}
-        CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
+        fallback_emoji = str(item.get('emoji', '📱') or '📱')[:2]
+        OPERATORS[key] = {'title': title, 'price': price, 'command': f'/{key}'}
+        if emoji_id or key not in CUSTOM_OPERATOR_EMOJI:
+            CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji or '📱')
         db.set_setting(f'price_{key}', str(price))
         db.set_setting(f'price_hold_{key}', str(price))
         db.set_setting(f'price_no_hold_{key}', str(price))
         db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
         db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
-        upsert_operator_store(key, title, price, command, emoji_id, fallback_emoji, 0, 1)
-    try:
-        rows = db.conn.execute("SELECT * FROM operators_store WHERE is_enabled=1 ORDER BY is_base DESC, key ASC").fetchall()
-    except Exception:
-        rows = []
-    for row in rows:
-        key = str(row['key']).strip().lower()
-        title = str(row['title']).strip()
-        if not key or not title:
-            continue
-        price = float(row['price'] or 0)
-        command = str(row['command'] or f'/{key}')
-        OPERATORS[key] = {'title': title, 'price': price, 'command': command}
-        CUSTOM_OPERATOR_EMOJI[key] = (str(row['emoji_id'] or ''), str(row['emoji'] or '📱')[:2] or '📱')
-        db.set_setting(f'price_{key}', db.get_setting(f'price_{key}', str(price)))
-        db.set_setting(f'price_hold_{key}', db.get_setting(f'price_hold_{key}', str(price)))
-        db.set_setting(f'price_no_hold_{key}', db.get_setting(f'price_no_hold_{key}', str(price)))
-        db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
-        db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
-    sync_operators_to_store()
 
 
 def load_extra_operator_items():
-    try:
-        rows = db.conn.execute("SELECT * FROM operators_store WHERE is_base=0 AND is_enabled=1 ORDER BY key ASC").fetchall()
-    except Exception:
-        rows = []
-    if rows:
-        return [dict(key=row['key'], title=row['title'], price=row['price'], command=row['command'], emoji_id=row['emoji_id'] or '', emoji=row['emoji'] or '📱') for row in rows]
     raw = db.get_setting('extra_operators_json', '[]') or '[]'
     try:
         items = json.loads(raw)
@@ -2500,23 +2390,7 @@ def load_extra_operator_items():
 
 
 def save_extra_operator_items(items):
-    clean = []
-    seen = set()
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        key = re.sub(r'[^a-z0-9_]+', '', str(item.get('key', '')).strip().lower())
-        title = str(item.get('title', '')).strip()
-        if not key or not title or key in seen:
-            continue
-        seen.add(key)
-        price = float(item.get('price', 0) or 0)
-        command = str(item.get('command') or f'/{key}')
-        emoji_id = str(item.get('emoji_id', '') or '')
-        emoji = str(item.get('emoji', '📱') or '📱')[:2] or '📱'
-        clean.append({'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': emoji})
-        upsert_operator_store(key, title, price, command, emoji_id, emoji, 0, 1)
-    db.set_setting('extra_operators_json', json.dumps(clean, ensure_ascii=False))
+    db.set_setting('extra_operators_json', json.dumps(items, ensure_ascii=False))
 
 
 load_extra_operators_from_settings()
@@ -2557,9 +2431,8 @@ def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> 
         custom = db.get_user_price(user_id, operator_key, mode)
         if custom is not None:
             return float(custom)
-    default_price = float(OPERATORS.get(operator_key, {}).get('price', 0) or 0)
-    legacy = db.get_setting(f"price_{operator_key}", str(default_price))
-    return float(db.get_setting(f"price_{mode}_{operator_key}", legacy) or 0)
+    legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]['price']))
+    return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
 
 def count_waiting_mode(operator_key: str, mode: str) -> int:
@@ -2770,24 +2643,18 @@ def set_referrer_if_empty(user_id: int, referrer_id: int | None) -> bool:
     return True
 
 
-def credit_referral_bonus(source_user_id: int, margin_amount: float, item_id: int | None = None) -> tuple[int | None, float]:
-    # Реферальный процент начисляется только с маржи: прайс группы минус прайс сдачи.
-    if float(margin_amount or 0) <= 0:
+def credit_referral_bonus(source_user_id: int, earned_amount: float) -> tuple[int | None, float]:
+    if float(earned_amount or 0) <= 0:
         return None, 0.0
     row = db.get_user(int(source_user_id))
     if not row or 'referred_by' not in row.keys() or not row['referred_by']:
         return None, 0.0
     referrer_id = int(row['referred_by'])
-    bonus = round(float(margin_amount) * 0.05, 2)
+    bonus = round(float(earned_amount) * 0.05, 2)
     if bonus <= 0:
         return referrer_id, 0.0
     db.add_balance(referrer_id, bonus)
     db.conn.execute("UPDATE users SET ref_earned=COALESCE(ref_earned,0)+? WHERE user_id=?", (bonus, referrer_id))
-    if item_id is not None:
-        try:
-            db.conn.execute("UPDATE queue_items SET referral_bonus=COALESCE(referral_bonus,0)+? WHERE id=?", (bonus, int(item_id)))
-        except Exception:
-            pass
     db.conn.commit()
     return referrer_id, bonus
 
@@ -2819,38 +2686,11 @@ def user_today_queue_items(user_id: int):
     ).fetchall()
 
 
-MY_NUMBERS_PAGE_SIZE = 10
-
-def user_active_queue_items(user_id: int, limit: int | None = None, offset: int = 0):
-    sql = "SELECT * FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress') ORDER BY " + queue_order_sql()
-    params = [int(user_id)]
-    if limit is not None:
-        sql += " LIMIT ? OFFSET ?"
-        params.extend([int(limit), int(offset)])
-    return db.conn.execute(sql, tuple(params)).fetchall()
-
-def user_active_queue_count(user_id: int) -> int:
-    row = db.conn.execute("SELECT COUNT(*) AS c FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress')", (int(user_id),)).fetchone()
-    return int((row['c'] if row else 0) or 0)
-
-def user_daily_submit_stats(user_id: int, date_start: str | None = None, date_end: str | None = None):
-    if not date_start or not date_end:
-        date_start, date_end = msk_day_window()
+def user_active_queue_items(user_id: int):
     return db.conn.execute(
-        """
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
-            SUM(CASE WHEN status IN ('taken','in_progress') THEN 1 ELSE 0 END) AS active,
-            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
-            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slipped,
-            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
-            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS earned
-        FROM queue_items
-        WHERE user_id=? AND created_at>=? AND created_at<?
-        """,
-        (int(user_id), date_start, date_end),
-    ).fetchone()
+        "SELECT * FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress') ORDER BY id DESC",
+        (user_id,),
+    ).fetchall()
 
 
 def queue_position(item_id: int):
@@ -2938,17 +2778,15 @@ def op_emoji_html(operator_key: str) -> str:
     return fallback
 
 def op_html(operator_key: str) -> str:
-    title = OPERATORS.get(operator_key, {}).get('title', operator_key)
-    return f"{op_emoji_html(operator_key)} <b>{escape(title)}</b>"
+    return f"{op_emoji_html(operator_key)} <b>{escape(OPERATORS[operator_key]['title'])}</b>"
 
 def op_text(operator_key: str) -> str:
     fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
-    title = OPERATORS.get(operator_key, {}).get('title', operator_key)
-    return f"{fallback} {title}"
+    return f"{fallback} {OPERATORS[operator_key]['title']}"
 
 
 def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
-    title = OPERATORS.get(operator_key, {}).get('title', operator_key)
+    title = OPERATORS[operator_key]['title']
     if not with_fallback:
         return title
     fallback = (CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1] or "📱").strip()
@@ -3300,18 +3138,15 @@ async def mirror_token_received(message: Message, state: FSMContext):
         mirror_menu_kb(),
     )
 
-@router.callback_query(F.data.startswith("menu:my"))
+@router.callback_query(F.data == "menu:my")
 async def menu_my(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
         await callback.answer()
         return
-    try:
-        page = int((callback.data or 'menu:my').split(':')[2]) if len((callback.data or '').split(':')) >= 3 else 0
-    except Exception:
-        page = 0
-    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(callback.from_user.id, page))
+    items = user_active_queue_items(callback.from_user.id)
+    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
     await callback.answer()
 
 @router.callback_query(F.data == "menu:profile")
@@ -4361,14 +4196,13 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     else:
         OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
-    save_extra_operator_items(extra_items)
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
     db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
     CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
-    upsert_operator_store(key, title, float(price or 0), command, emoji_id, fallback_emoji, 1 if key in base_keys else 0, 1)
     await state.clear()
     suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
     result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
@@ -4401,7 +4235,6 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     except Exception:
         pass
     db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
-    db.conn.execute("UPDATE operators_store SET is_enabled=0, updated_at=? WHERE key=?", (now_str(), key))
     db.conn.commit()
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
@@ -5814,14 +5647,13 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     else:
         OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
-    save_extra_operator_items(extra_items)
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
     db.set_setting(f'price_{key}', str(price))
     db.set_setting(f'price_hold_{key}', str(price))
     db.set_setting(f'price_no_hold_{key}', str(price))
     db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
     CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
-    upsert_operator_store(key, title, float(price or 0), command, emoji_id, fallback_emoji, 1 if key in base_keys else 0, 1)
     await state.clear()
     suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
     result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
@@ -5845,7 +5677,7 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
         return
     extra_items = load_extra_operator_items()
     extra_items = [item for item in extra_items if not (isinstance(item, dict) and str(item.get('key', '')).strip().lower() == key)]
-    save_extra_operator_items(extra_items)
+    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
     title = OPERATORS.get(key, {}).get('title', key)
     try:
         del OPERATORS[key]
@@ -5856,7 +5688,6 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     except Exception:
         pass
     db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
-    db.conn.execute("UPDATE operators_store SET is_enabled=0, updated_at=? WHERE key=?", (now_str(), key))
     db.conn.commit()
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
@@ -6463,7 +6294,7 @@ async def hold_watcher(bot: Bot):
                 try:
                     db.complete_queue_item(item.id)
                     db.add_balance(item.user_id, float(item.price))
-                    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, max(0.0, float((getattr(item, 'charge_amount', None) or 0) or 0) - float(item.price or 0)), item.id)
+                    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
                     if referrer_id and ref_bonus > 0:
                         try:
                             await notify_user(bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
@@ -6798,12 +6629,7 @@ async def admin_queue_remove(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("myremove:"))
 async def myremove_cb(callback: CallbackQuery, state: FSMContext):
-    parts = (callback.data or '').split(':')
-    item_id = int(parts[1])
-    try:
-        page = int(parts[2]) if len(parts) > 2 else 0
-    except Exception:
-        page = 0
+    item_id = int(callback.data.split(":")[-1])
     row = db.conn.execute("SELECT * FROM queue_items WHERE id=? AND user_id=?", (item_id, callback.from_user.id)).fetchone()
     if not row:
         await callback.answer("Заявка не найдена", show_alert=True)
@@ -6812,7 +6638,8 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Убрать можно только номер из очереди", show_alert=True)
         return
     remove_queue_item(item_id, reason='user_removed')
-    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(callback.from_user.id, page))
+    items = user_active_queue_items(callback.from_user.id)
+    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
     await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{item_id}</b>")
     await callback.answer("Номер убран")
 
@@ -6899,7 +6726,7 @@ async def instant_pay_cb(callback: CallbackQuery):
         return
     db.complete_queue_item(item_id)
     db.add_balance(item.user_id, float(item.price))
-    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, max(0.0, float((getattr(item, 'charge_amount', None) or 0) or 0) - float(item.price or 0)), item.id)
+    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
     if referrer_id and ref_bonus > 0:
         try:
             await notify_user(callback.bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
@@ -7231,7 +7058,6 @@ async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
         return
     try:
         backup_path = db.replace_with_uploaded_db(str(temp_path))
-        load_extra_operators_from_settings()
     except Exception:
         logging.exception("db_upload_receive failed")
         temp_path.unlink(missing_ok=True)
@@ -7274,7 +7100,7 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
                 SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS paid_total,
                 SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS spent_total,
-                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price - COALESCE(referral_bonus,0) ELSE 0 END) AS margin_total,
+                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
             WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
