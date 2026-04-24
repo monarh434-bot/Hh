@@ -283,6 +283,8 @@ class Database:
                 mode TEXT NOT NULL,
                 added_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                chat_title TEXT,
+                thread_title TEXT,
                 UNIQUE(chat_id, thread_id, mode)
             )
             """
@@ -313,7 +315,14 @@ class Database:
                 work_started_by INTEGER,
                 fail_reason TEXT,
                 completed_at TEXT,
-                timer_last_render TEXT
+                timer_last_render TEXT,
+                submit_bot_token TEXT,
+                charge_chat_id INTEGER,
+                charge_thread_id INTEGER,
+                charge_amount REAL,
+                user_hold_chat_id INTEGER,
+                user_hold_message_id INTEGER,
+                charge_refunded INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -1227,14 +1236,26 @@ def profile_kb():
     kb.adjust(1)
     return kb.as_markup()
 
-def my_numbers_kb(items):
+MY_NUMBERS_PAGE_SIZE = 8
+
+def my_numbers_kb(items, page: int = 0):
     kb = InlineKeyboardBuilder()
-    for item in items[:10]:
+    total = len(items or [])
+    max_page = max((total - 1) // MY_NUMBERS_PAGE_SIZE, 0)
+    page = max(0, min(int(page or 0), max_page))
+    start = page * MY_NUMBERS_PAGE_SIZE
+    for item in (items or [])[start:start + MY_NUMBERS_PAGE_SIZE]:
         if item['status'] == 'queued':
-            kb.button(text=f"🗑 Убрать #{item['id']}", callback_data=f"myremove:{item['id']}")
-    kb.button(text="↻ Обновить", callback_data="menu:my")
+            kb.button(text=f"🗑 Убрать #{item['id']}", callback_data=f"myremove:{item['id']}:{page}")
+    if total > MY_NUMBERS_PAGE_SIZE:
+        prev_page = max(page - 1, 0)
+        next_page = min(page + 1, max_page)
+        kb.button(text="⬅️ Назад", callback_data=f"my:page:{prev_page}")
+        kb.button(text=f"{page + 1}/{max_page + 1}", callback_data="noop")
+        kb.button(text="➡️ Далее", callback_data=f"my:page:{next_page}")
+    kb.button(text="↻ Обновить", callback_data=f"my:page:{page}")
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
-    kb.adjust(1)
+    kb.adjust(1, 3, 1, 1)
     return kb.as_markup()
 
 
@@ -1681,7 +1702,6 @@ def queue_caption(item: QueueItem) -> str:
         f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
         f"👤 От: <b>{escape(item.full_name)}</b>\n"
-        f"🆔 ID: <code>{item.user_id}</code>\n"
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
@@ -1804,6 +1824,14 @@ def render_profile(user_id: int) -> str:
             f"💰 <b>Всего заработано:</b> <b>{usd(stats['earned'] or 0)}</b>",
             f"📤 <b>Сейчас в очередях:</b> {current_queue}",
         ])
+        + "\n\n<b>📆 Статистика за сегодня:</b>\n"
+        + (lambda d: quote_block([
+            f"📥 <b>Поставлено:</b> {int((d['total'] if d else 0) or 0)}",
+            f"✅ <b>Успешно:</b> {int((d['completed'] if d else 0) or 0)}",
+            f"❌ <b>Слеты:</b> {int((d['slipped'] if d else 0) or 0)}",
+            f"⚠️ <b>Ошибки:</b> {int((d['errors'] if d else 0) or 0)}",
+            f"💰 <b>Заработано сегодня:</b> <b>{usd((d['earned'] if d else 0) or 0)}</b>",
+        ]))(user_daily_submit_stats(user_id))
         + "\n\n<b>🎁 Реферальная система</b>\n"
         + quote_block([
             f"👥 <b>Рефералов:</b> {ref_count}",
@@ -1839,24 +1867,29 @@ def render_withdraw_setup() -> str:
         "👉 <b>Просто отправьте скопированную ссылку прямо мне в чат, и я её запомню.</b>"
     )
 
-def render_my_numbers(user_id: int) -> str:
+def render_my_numbers(user_id: int, page: int = 0) -> str:
     items = user_active_queue_items(user_id)
+    total = len(items or [])
+    max_page = max((total - 1) // MY_NUMBERS_PAGE_SIZE, 0)
+    page = max(0, min(int(page or 0), max_page))
     if not items:
         body = "• Активных заявок пока нет."
     else:
         rows = []
-        for row in items[:15]:
+        start = page * MY_NUMBERS_PAGE_SIZE
+        for row in items[start:start + MY_NUMBERS_PAGE_SIZE]:
             pos = queue_position(row['id']) if row['status'] == 'queued' else None
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
-            priority_text = ""
             rows.append(
                 f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • "
-                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{priority_text}{pos_text}"
+                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{pos_text}"
             )
-        body = "\n".join(rows)
+        body = "\n".join(rows) or "• На этой странице пусто."
+    page_line = f"\n\n<b>Страница:</b> {page + 1}/{max_page + 1} • <b>Всего активных:</b> {total}" if total else ""
     return (
         "<b>📦 Мои номера — активные</b>\n\n"
         + quote_block([body])
+        + page_line
         + "\n\n<i>Здесь видны номера, которые ещё стоят в очереди, взяты или в работе. Они не пропадают в 00:00, пока вы сами их не уберёте или их не обработают.</i>"
     )
 
@@ -2642,20 +2675,30 @@ def set_referrer_if_empty(user_id: int, referrer_id: int | None) -> bool:
     return True
 
 
-def credit_referral_bonus(source_user_id: int, earned_amount: float) -> tuple[int | None, float]:
-    if float(earned_amount or 0) <= 0:
+def credit_referral_bonus(source_user_id: int, margin_amount: float) -> tuple[int | None, float]:
+    # Реферальный процент считается только с маржи, а не с цены сдачи номера.
+    if float(margin_amount or 0) <= 0:
         return None, 0.0
     row = db.get_user(int(source_user_id))
     if not row or 'referred_by' not in row.keys() or not row['referred_by']:
         return None, 0.0
     referrer_id = int(row['referred_by'])
-    bonus = round(float(earned_amount) * 0.05, 2)
+    bonus = round(max(float(margin_amount or 0), 0.0) * 0.05, 2)
     if bonus <= 0:
         return referrer_id, 0.0
     db.add_balance(referrer_id, bonus)
     db.conn.execute("UPDATE users SET ref_earned=COALESCE(ref_earned,0)+? WHERE user_id=?", (bonus, referrer_id))
     db.conn.commit()
+    logging.info("ref bonus from margin source_user_id=%s referrer_id=%s margin=%s bonus=%s", source_user_id, referrer_id, margin_amount, bonus)
     return referrer_id, bonus
+
+def queue_item_margin(item: QueueItem) -> float:
+    try:
+        charge = float(getattr(item, 'charge_amount', None) or 0)
+        payout = float(getattr(item, 'price', None) or 0)
+        return max(charge - payout, 0.0)
+    except Exception:
+        return 0.0
 
 
 def operator_command_map() -> dict[str, str]:
@@ -2683,6 +2726,27 @@ def user_today_queue_items(user_id: int):
         "SELECT * FROM queue_items WHERE user_id=? AND created_at >= ? AND created_at < ? ORDER BY id DESC",
         (user_id, start, end),
     ).fetchall()
+
+
+def user_daily_submit_stats(user_id: int, day_start: str | None = None, day_end: str | None = None):
+    if day_start is None or day_end is None:
+        day_start, day_end = msk_day_window()
+    return db.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
+            SUM(CASE WHEN status='taken' THEN 1 ELSE 0 END) AS taken,
+            SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+            SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slipped,
+            SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS earned
+        FROM queue_items
+        WHERE user_id=? AND created_at>=? AND created_at<?
+        """,
+        (int(user_id), day_start, day_end),
+    ).fetchone()
 
 
 def user_active_queue_items(user_id: int):
@@ -3148,7 +3212,18 @@ async def menu_my(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     items = user_active_queue_items(callback.from_user.id)
-    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
+    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, 0), my_numbers_kb(items, 0))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("my:page:"))
+async def my_numbers_page(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        page = int(callback.data.split(":")[-1])
+    except Exception:
+        page = 0
+    items = user_active_queue_items(callback.from_user.id)
+    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(items, page))
     await callback.answer()
 
 @router.callback_query(F.data == "menu:profile")
@@ -3158,7 +3233,12 @@ async def menu_profile(callback: CallbackQuery, state: FSMContext):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
         await callback.answer()
         return
-    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
+    try:
+        text = render_profile(callback.from_user.id)
+    except Exception:
+        logging.exception("profile render failed user_id=%s", callback.from_user.id)
+        text = "<b>👤 Профиль</b>\n\nПрофиль временно восстановлен. Попробуйте открыть ещё раз или напишите /start."
+    await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), text, profile_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "menu:ref")
@@ -6296,7 +6376,7 @@ async def hold_watcher(bot: Bot):
                 try:
                     db.complete_queue_item(item.id)
                     db.add_balance(item.user_id, float(item.price))
-                    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
+                    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, queue_item_margin(item))
                     if referrer_id and ref_bonus > 0:
                         try:
                             await notify_user(bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
@@ -6641,7 +6721,7 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
         return
     remove_queue_item(item_id, reason='user_removed')
     items = user_active_queue_items(callback.from_user.id)
-    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id), my_numbers_kb(items))
+    await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(items, page))
     await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{item_id}</b>")
     await callback.answer("Номер убран")
 
@@ -6728,7 +6808,7 @@ async def instant_pay_cb(callback: CallbackQuery):
         return
     db.complete_queue_item(item_id)
     db.add_balance(item.user_id, float(item.price))
-    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, float(item.price))
+    referrer_id, ref_bonus = credit_referral_bonus(item.user_id, queue_item_margin(item))
     if referrer_id and ref_bonus > 0:
         try:
             await notify_user(callback.bot, referrer_id, f"<b>🎁 Реферальное начисление</b>\n\nВаш реферал заработал {usd(item.price)}.\nВам начислено 5%: <b>{usd(ref_bonus)}</b>")
