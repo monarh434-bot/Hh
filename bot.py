@@ -2426,6 +2426,18 @@ def msk_day_window() -> tuple[str, str]:
 
 def ensure_extra_schema():
     cur = db.conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS custom_operators (
+            key TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            command TEXT NOT NULL,
+            emoji_id TEXT DEFAULT '',
+            emoji TEXT DEFAULT '📱',
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
     user_cols = {r['name'] for r in cur.execute("PRAGMA table_info(users)").fetchall()}
     if 'is_blocked' not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
@@ -2482,35 +2494,129 @@ def ensure_extra_schema():
 ensure_extra_schema()
 
 
+def _normalize_operator_payload(item: dict):
+    key = str(item.get('key', '')).strip().lower()
+    key = re.sub(r'[^a-z0-9_]+', '', key)
+    title = str(item.get('title', '')).strip()
+    if not title:
+        title = key.upper() if key else ''
+    if not key or not title:
+        return None
+    try:
+        price = float(item.get('price', 0) or 0)
+    except Exception:
+        price = 0.0
+    command = str(item.get('command', f'/{key}') or f'/{key}').strip()
+    if not command.startswith('/'):
+        command = '/' + command
+    emoji_id = str(item.get('emoji_id', '') or '').strip()
+    fallback_emoji = str(item.get('emoji', item.get('fallback', '📱')) or '📱')[:2]
+    return {'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': fallback_emoji or '📱'}
+
+
+def upsert_custom_operator_store(key: str, title: str, price: float, command: str = None, emoji_id: str = '', emoji: str = '📱'):
+    key = re.sub(r'[^a-z0-9_]+', '', str(key or '').strip().lower())
+    if not key:
+        return
+    command = command or f'/{key}'
+    if not command.startswith('/'):
+        command = '/' + command
+    try:
+        price = float(price or 0)
+    except Exception:
+        price = 0.0
+    title = str(title or key.upper()).strip()
+    emoji_id = str(emoji_id or '').strip()
+    emoji = str(emoji or '📱')[:2] or '📱'
+    db.conn.execute(
+        """
+        INSERT INTO custom_operators(key,title,price,command,emoji_id,emoji,is_deleted,updated_at)
+        VALUES(?,?,?,?,?,?,0,?)
+        ON CONFLICT(key) DO UPDATE SET
+            title=excluded.title,
+            price=excluded.price,
+            command=excluded.command,
+            emoji_id=excluded.emoji_id,
+            emoji=excluded.emoji,
+            is_deleted=0,
+            updated_at=excluded.updated_at
+        """,
+        (key, title, price, command, emoji_id, emoji, now_str()),
+    )
+    db.set_setting(f'operator_title_{key}', title)
+    db.set_setting(f'operator_command_{key}', command)
+    db.set_setting(f'operator_emoji_id_{key}', emoji_id)
+    db.set_setting(f'operator_emoji_{key}', emoji)
+    db.set_setting(f'price_{key}', str(price))
+    db.set_setting(f'price_hold_{key}', str(price))
+    db.set_setting(f'price_no_hold_{key}', str(price))
+    db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
+    db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+    # keep old json mirror too, so older code/backups still see custom operators
+    items = load_extra_operator_items()
+    payload = {'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': emoji}
+    found = False
+    for item in items:
+        if isinstance(item, dict) and str(item.get('key','')).strip().lower() == key:
+            item.update(payload)
+            found = True
+            break
+    base_keys = {'mts','mts_premium','bil','mega','t2','vtb','gaz'}
+    if not found and key not in base_keys:
+        items.append(payload)
+    db.set_setting('extra_operators_json', json.dumps(items, ensure_ascii=False))
+    OPERATORS[key] = {'title': title, 'price': price, 'command': command}
+    CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, emoji)
+
+
 def load_extra_operators_from_settings():
+    items_by_key = {}
+    # 1) old json storage
     raw = db.get_setting('extra_operators_json', '[]') or '[]'
     try:
-        items = json.loads(raw)
+        raw_items = json.loads(raw)
     except Exception:
-        items = []
-    if not isinstance(items, list):
-        items = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get('key', '')).strip().lower()
-        title = str(item.get('title', '')).strip()
-        if not key or not title:
-            continue
-        try:
-            price = float(item.get('price', 0) or 0)
-        except Exception:
-            price = 0.0
-        emoji_id = str(item.get('emoji_id', '') or '').strip()
-        fallback_emoji = str(item.get('emoji', '📱') or '📱')[:2]
-        OPERATORS[key] = {'title': title, 'price': price, 'command': f'/{key}'}
-        if emoji_id or key not in CUSTOM_OPERATOR_EMOJI:
-            CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji or '📱')
-        db.set_setting(f'price_{key}', str(price))
-        db.set_setting(f'price_hold_{key}', str(price))
-        db.set_setting(f'price_no_hold_{key}', str(price))
-        db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
-        db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
+        raw_items = []
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if isinstance(item, dict):
+                payload = _normalize_operator_payload(item)
+                if payload:
+                    items_by_key[payload['key']] = payload
+    # 2) new reliable table storage
+    try:
+        rows = db.conn.execute("SELECT * FROM custom_operators WHERE COALESCE(is_deleted,0)=0").fetchall()
+        for r in rows:
+            payload = _normalize_operator_payload(dict(r))
+            if payload:
+                items_by_key[payload['key']] = payload
+    except Exception as e:
+        logging.exception("custom_operators load failed: %s", e)
+    # 3) recovery: if DB already has numbers on a custom operator, restore key so old numbers don't disappear
+    try:
+        rows = db.conn.execute("SELECT DISTINCT operator_key FROM queue_items WHERE operator_key IS NOT NULL AND operator_key != ''").fetchall()
+        for r in rows:
+            key = str(r['operator_key'] or '').strip().lower()
+            if not key or key in OPERATORS or key in items_by_key:
+                continue
+            title = db.get_setting(f'operator_title_{key}', key.upper())
+            price_raw = db.get_setting(f'price_{key}', None)
+            if price_raw is None:
+                pr = db.conn.execute("SELECT price FROM queue_items WHERE operator_key=? AND price IS NOT NULL ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+                price_raw = str(pr['price'] if pr and pr['price'] is not None else 0)
+            items_by_key[key] = {
+                'key': key,
+                'title': title,
+                'price': float(price_raw or 0),
+                'command': db.get_setting(f'operator_command_{key}', f'/{key}'),
+                'emoji_id': db.get_setting(f'operator_emoji_id_{key}', ''),
+                'emoji': db.get_setting(f'operator_emoji_{key}', '📱'),
+            }
+            logging.warning("Recovered missing custom operator from queue_items: key=%s title=%s", key, title)
+    except Exception as e:
+        logging.exception("recover operators from queue_items failed: %s", e)
+    for payload in items_by_key.values():
+        upsert_custom_operator_store(**payload)
 
 
 def load_extra_operator_items():
@@ -4382,13 +4488,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     else:
         OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
-    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
-    db.set_setting(f'price_{key}', str(price))
-    db.set_setting(f'price_hold_{key}', str(price))
-    db.set_setting(f'price_no_hold_{key}', str(price))
-    db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
-    db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
-    CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
+    upsert_custom_operator_store(key, title, price, command, emoji_id, fallback_emoji)
     await state.clear()
     suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
     result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
@@ -4420,7 +4520,8 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
         CUSTOM_OPERATOR_EMOJI.pop(key, None)
     except Exception:
         pass
-    db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
+    db.conn.execute("UPDATE custom_operators SET is_deleted=1, updated_at=? WHERE key=?", (now_str(), key))
+    # цены/названия оставляем в settings, чтобы старые заявки по этому оператору не пропадали из истории
     db.conn.commit()
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
@@ -5833,13 +5934,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
     else:
         OPERATORS[key] = {'title': title, 'price': price, 'command': command}
 
-    db.set_setting('extra_operators_json', json.dumps(extra_items, ensure_ascii=False))
-    db.set_setting(f'price_{key}', str(price))
-    db.set_setting(f'price_hold_{key}', str(price))
-    db.set_setting(f'price_no_hold_{key}', str(price))
-    db.set_setting(f'allow_hold_{key}', db.get_setting(f'allow_hold_{key}', '1'))
-    db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
-    CUSTOM_OPERATOR_EMOJI[key] = (emoji_id, fallback_emoji)
+    upsert_custom_operator_store(key, title, price, command, emoji_id, fallback_emoji)
     await state.clear()
     suffix = f" • emoji_id: <code>{emoji_id}</code>" if emoji_id else " • обычный смайл"
     result_text = "✅ Эмодзи оператора обновлён" if data.get('edit_existing_operator_emoji') else "✅ Оператор сохранён"
@@ -5873,7 +5968,8 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
         CUSTOM_OPERATOR_EMOJI.pop(key, None)
     except Exception:
         pass
-    db.conn.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)", (f'price_{key}', f'price_hold_{key}', f'price_no_hold_{key}', f'allow_hold_{key}', f'allow_no_hold_{key}'))
+    db.conn.execute("UPDATE custom_operators SET is_deleted=1, updated_at=? WHERE key=?", (now_str(), key))
+    # цены/названия оставляем в settings, чтобы старые заявки по этому оператору не пропадали из истории
     db.conn.commit()
     await state.clear()
     await message.answer(f"✅ Оператор удалён: <b>{escape(title)}</b> ({escape(key)})", reply_markup=admin_root_kb())
