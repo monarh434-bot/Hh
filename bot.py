@@ -1742,10 +1742,12 @@ def escape(value: Optional[str]) -> str:
     return html.escape(str(value or "-"))
 
 
-def queue_caption(item: QueueItem) -> str:
-    # В карточке заявки показываем именно прайс сдачи из бота,
-    # сохранённый в queue_items.price на момент загрузки номера.
-    submit_price = getattr(item, 'price', None)
+def queue_caption(item: QueueItem, price_view: str = "group") -> str:
+    """Карточка заявки.
+    price_view='group' — для рабочих групп: показывает цену, по которой группа берёт.
+    price_view='submit' — для ЛС пользователя: показывает цену, по которой пользователь сдаёт.
+    price_view='none' — без цены.
+    """
     text = (
         f"📱 {op_html(item.operator_key)}\n\n"
         f"🧾 Заявка: <b>{item.id}</b>\n"
@@ -1753,8 +1755,17 @@ def queue_caption(item: QueueItem) -> str:
         f"📞 Номер: <code>{escape(pretty_phone(item.normalized_phone))}</code>\n"
         f"🔄 Режим: <b>{'Холд' if item.mode == 'hold' else 'БезХолд'}</b>"
     )
-    if submit_price not in (None, 0, 0.0):
-        text += f"\n🏷 Прайс сдачи: <b>{usd(float(submit_price))}</b>"
+    try:
+        if price_view == "group":
+            group_price = getattr(item, 'charge_amount', None)
+            if group_price not in (None, 0, 0.0):
+                text += f"\n🏷 Прайс группы: <b>{usd(float(group_price))}</b>"
+        elif price_view == "submit":
+            submit_price = getattr(item, 'price', None)
+            if submit_price not in (None, 0, 0.0):
+                text += f"\n🏷 Прайс сдачи: <b>{usd(float(submit_price))}</b>"
+    except Exception:
+        logging.exception("queue_caption price render failed item_id=%s price_view=%s", getattr(item, 'id', None), price_view)
     if item.status == "in_progress":
         text += "\n\n🚀 <b>Работа началась</b>"
         if item.mode == "hold":
@@ -1768,7 +1779,6 @@ def queue_caption(item: QueueItem) -> str:
         else:
             text += "\n⚡ Режим БезХолд."
     return text
-
 
 def render_referral(user_id: int) -> str:
     user = db.get_user(user_id)
@@ -1830,56 +1840,99 @@ def render_start(user_id: int) -> str:
     )
 
 def render_profile(user_id: int) -> str:
-    user = db.get_user(user_id)
-    stats = db.user_stats(user_id)
-    ops = db.user_operator_stats(user_id)
-    current_queue = int((stats['queued'] or 0) + (stats['taken'] or 0) + (stats['in_progress'] or 0))
-    username = f"@{escape(user['username'])}" if user and user['username'] else "—"
-    full_name = escape(user['full_name'] if user else '')
-    payout_link = db.get_payout_link(user_id)
+    """Безопасный профиль: не падает, даже если в старой БД не хватает полей/операторов."""
+    try:
+        user = db.get_user(user_id)
+    except Exception:
+        logging.exception("profile get_user failed user_id=%s", user_id)
+        user = None
+
+    def row_value(row, key, default=0):
+        try:
+            if row is not None and key in row.keys():
+                return row[key]
+        except Exception:
+            pass
+        return default
+
+    try:
+        stats = db.user_stats(user_id)
+    except Exception:
+        logging.exception("profile user_stats failed user_id=%s", user_id)
+        stats = None
+    try:
+        ops = db.user_operator_stats(user_id) or []
+    except Exception:
+        logging.exception("profile operator_stats failed user_id=%s", user_id)
+        ops = []
+
+    current_queue = int((row_value(stats, 'queued', 0) or 0) + (row_value(stats, 'taken', 0) or 0) + (row_value(stats, 'in_progress', 0) or 0))
+    username = f"@{escape(row_value(user, 'username', ''))}" if row_value(user, 'username', '') else "—"
+    full_name = escape(row_value(user, 'full_name', ''))
+    balance = float(row_value(user, 'balance', 0) or 0)
+    try:
+        payout_link = db.get_payout_link(user_id)
+    except Exception:
+        logging.exception("profile payout_link failed user_id=%s", user_id)
+        payout_link = None
     payout_status = "✅ Привязан" if payout_link else "❌ Не привязан"
     try:
         ref_count_row = db.conn.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)).fetchone()
         ref_count = int((ref_count_row['c'] if ref_count_row else 0) or 0)
     except Exception:
         ref_count = 0
-    ref_earned = float((user['ref_earned'] if user and 'ref_earned' in user.keys() else 0) or 0)
-    ops_text = "\n".join(
-        f"• {op_html(row['operator_key'])}: {row['total']} шт. / <b>{usd(row['earned'] or 0)}</b>"
-        for row in ops
-    ) or "• <i>Пока пусто</i>"
-    personal_price_lines = [
-        f"{op_emoji_html(key)} <b>{escape(data['title'])}</b> — <b>{usd(get_mode_price(key, 'hold', user_id))}</b> / <b>{usd(get_mode_price(key, 'no_hold', user_id))}</b>"
-        for key, data in OPERATORS.items()
-    ]
+    ref_earned = float(row_value(user, 'ref_earned', 0) or 0)
+
+    op_lines = []
+    for row in ops:
+        try:
+            key = row['operator_key']
+            op_lines.append(f"• {op_html(key)}: {int(row['total'] or 0)} шт. / <b>{usd(row['earned'] or 0)}</b>")
+        except Exception:
+            logging.exception("profile op row render failed user_id=%s", user_id)
+    ops_text = "\n".join(op_lines) or "• <i>Пока пусто</i>"
+
+    price_lines = []
+    for key, data in list(OPERATORS.items()):
+        try:
+            price_lines.append(f"{op_emoji_html(key)} <b>{escape(data.get('title', key))}</b> — <b>{usd(get_mode_price(key, 'hold', user_id))}</b> / <b>{usd(get_mode_price(key, 'no_hold', user_id))}</b>")
+        except Exception:
+            logging.exception("profile price line failed user_id=%s key=%s", user_id, key)
+    personal_price_lines = price_lines or ["• <i>Прайсы временно недоступны</i>"]
+
+    try:
+        d = user_daily_submit_stats(user_id)
+    except Exception:
+        logging.exception("profile daily stats failed user_id=%s", user_id)
+        d = None
+
     return (
         "<b>👤 Личный кабинет - ESIM Service X 💫</b>\n\n"
         + quote_block([
             f"🔘 <b>Имя:</b> {full_name}",
             f"™️ <b>Username:</b> {username}",
-            f"®️ <b>ID:</b> <code>{user_id}</code>",
-            f"💲 <b>Баланс:</b> <b>{usd(user['balance'] if user else 0)}</b>",
+            f"💲 <b>Баланс:</b> <b>{usd(balance)}</b>",
             f"💳 <b>Счёт CryptoBot:</b> {payout_status}",
         ])
         + "\n\n<b>💎 Ваши прайсы</b>\n"
         + quote_block(personal_price_lines)
         + "\n\n<b>📊 Ваша статистика:</b>\n"
         + quote_block([
-            f"🧾 <b>Всего заявок:</b> {int(stats['total'] or 0)}",
-            f"✅ <b>Успешно:</b> {int(stats['completed'] or 0)}",
-            f"❌ <b>Слеты:</b> {int(stats['slipped'] or 0)}",
-            f"⚠️ <b>Ошибки:</b> {int(stats['errors'] or 0)}",
-            f"💰 <b>Всего заработано:</b> <b>{usd(stats['earned'] or 0)}</b>",
+            f"🧾 <b>Всего заявок:</b> {int(row_value(stats, 'total', 0) or 0)}",
+            f"✅ <b>Успешно:</b> {int(row_value(stats, 'completed', 0) or 0)}",
+            f"❌ <b>Слеты:</b> {int(row_value(stats, 'slipped', 0) or 0)}",
+            f"⚠️ <b>Ошибки:</b> {int(row_value(stats, 'errors', 0) or 0)}",
+            f"💰 <b>Всего заработано:</b> <b>{usd(row_value(stats, 'earned', 0) or 0)}</b>",
             f"📤 <b>Сейчас в очередях:</b> {current_queue}",
         ])
         + "\n\n<b>📆 Статистика за сегодня:</b>\n"
-        + (lambda d: quote_block([
-            f"📥 <b>Поставлено:</b> {int((d['total'] if d else 0) or 0)}",
-            f"✅ <b>Успешно:</b> {int((d['completed'] if d else 0) or 0)}",
-            f"❌ <b>Слеты:</b> {int((d['slipped'] if d else 0) or 0)}",
-            f"⚠️ <b>Ошибки:</b> {int((d['errors'] if d else 0) or 0)}",
-            f"💰 <b>Заработано сегодня:</b> <b>{usd((d['earned'] if d else 0) or 0)}</b>",
-        ]))(user_daily_submit_stats(user_id))
+        + quote_block([
+            f"📥 <b>Поставлено:</b> {int(row_value(d, 'total', 0) or 0)}",
+            f"✅ <b>Успешно:</b> {int(row_value(d, 'completed', 0) or 0)}",
+            f"❌ <b>Слеты:</b> {int(row_value(d, 'slipped', 0) or 0)}",
+            f"⚠️ <b>Ошибки:</b> {int(row_value(d, 'errors', 0) or 0)}",
+            f"💰 <b>Заработано сегодня:</b> <b>{usd(row_value(d, 'earned', 0) or 0)}</b>",
+        ])
         + "\n\n<b>🎁 Реферальная система</b>\n"
         + quote_block([
             f"👥 <b>Рефералов:</b> {ref_count}",
@@ -1890,7 +1943,6 @@ def render_profile(user_id: int) -> str:
         + quote_block([ops_text])
         + "\n\n<i>Профиль обновляется автоматически по мере работы в боте.</i>"
     )
-
 def render_withdraw(user_id: int) -> str:
     user = db.get_user(user_id)
     balance = usd(float(user['balance'] if user else 0))
@@ -2891,16 +2943,20 @@ def op_emoji_html(operator_key: str) -> str:
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
     return fallback
 
+def op_title(operator_key: str) -> str:
+    data = OPERATORS.get(operator_key) or {}
+    return str(data.get('title') or operator_key or 'Оператор')
+
 def op_html(operator_key: str) -> str:
-    return f"{op_emoji_html(operator_key)} <b>{escape(OPERATORS[operator_key]['title'])}</b>"
+    return f"{op_emoji_html(operator_key)} <b>{escape(op_title(operator_key))}</b>"
 
 def op_text(operator_key: str) -> str:
-    fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
-    return f"{fallback} {OPERATORS[operator_key]['title']}"
+    fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1] or "📱"
+    return f"{fallback} {op_title(operator_key)}"
 
 
 def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
-    title = OPERATORS[operator_key]['title']
+    title = op_title(operator_key)
     if not with_fallback:
         return title
     fallback = (CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1] or "📱").strip()
@@ -6759,10 +6815,24 @@ async def admin_queue_remove(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("myremove:"))
 async def myremove_cb(callback: CallbackQuery, state: FSMContext):
-    item_id = int(callback.data.split(":")[-1])
-    row = db.conn.execute("SELECT * FROM queue_items WHERE id=? AND user_id=?", (item_id, callback.from_user.id)).fetchone()
+    parts = (callback.data or "").split(":")
+    try:
+        item_id = int(parts[1])
+    except Exception:
+        await callback.answer("Некорректная кнопка удаления", show_alert=True)
+        return
+    try:
+        page = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        page = 0
+    row = db.conn.execute(
+        "SELECT * FROM queue_items WHERE id=? AND user_id=? AND status IN ('queued','taken','in_progress')",
+        (item_id, callback.from_user.id),
+    ).fetchone()
     if not row:
-        await callback.answer("Заявка не найдена", show_alert=True)
+        items = user_active_queue_items(callback.from_user.id)
+        await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(items, page))
+        await callback.answer("Заявка уже неактуальна или обработана", show_alert=True)
         return
     if row["status"] != "queued":
         await callback.answer("Убрать можно только номер из очереди", show_alert=True)
@@ -6770,7 +6840,7 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
     remove_queue_item(item_id, reason='user_removed')
     items = user_active_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(items, page))
-    await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🆔 <code>{callback.from_user.id}</code>\n🧾 Заявка: <b>#{item_id}</b>")
+    await send_log(callback.bot, f"<b>🗑 Удаление из очереди</b>\n👤 {escape(callback.from_user.full_name)}\n🧾 Заявка: <b>#{item_id}</b>")
     await callback.answer("Номер убран")
 
 @router.callback_query(F.data.startswith("take_start:"))
@@ -6794,7 +6864,7 @@ async def take_start_cb(callback: CallbackQuery):
         pass
     try:
         if fresh.mode == 'hold':
-            user_msg = await send_queue_item_photo_to_chat(callback.bot, int(fresh.user_id), fresh, queue_caption(fresh), message_thread_id=None)
+            user_msg = await send_queue_item_photo_to_chat(callback.bot, int(fresh.user_id), fresh, queue_caption(fresh, price_view='submit'), message_thread_id=None)
             if user_msg:
                 db.conn.execute("UPDATE queue_items SET user_hold_chat_id=?, user_hold_message_id=? WHERE id=?", (int(fresh.user_id), int(user_msg.message_id), fresh.id))
                 db.conn.commit()
