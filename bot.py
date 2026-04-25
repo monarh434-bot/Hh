@@ -3,6 +3,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import sqlite3
 import shutil
@@ -28,27 +29,74 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
 # CONFIG - ALL IN ONE FILE
+# Secrets are loaded from Railway Variables / environment.
+# Do NOT hardcode real bot tokens or payment API tokens in this file.
 # =========================================================
-BOT_TOKEN = "8755242086:AAHc5_AOXKyBpgOqj-7DzaIYEkgnBtXcPSY"
-DB_PATH = "bot.db"
-BOT_USERNAME_FALLBACK = "esimservicexbot"
+
+def _env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = _env_str(name, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = _env_str(name, str(default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env_str(name, "1" if default else "0").lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int_list(name: str, default: list[int] | None = None) -> list[int]:
+    raw = _env_str(name, "")
+    if not raw:
+        return list(default or [])
+    values: list[int] = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            logging.warning("Invalid integer in %s: %r", name, part)
+    return values
+
+
+BOT_TOKEN = _env_str("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Set it in Railway Variables before starting the bot.")
+
+DB_PATH = _env_str("DB_PATH", "bot.db")
+BOT_USERNAME_FALLBACK = _env_str("BOT_USERNAME_FALLBACK", "esimservicexbot")
 
 # Roles
-CHIEF_ADMIN_ID = 7133092873
-BOOTSTRAP_ADMINS = [626387429]
-BOOTSTRAP_OPERATORS = []
+CHIEF_ADMIN_ID = _env_int("CHIEF_ADMIN_ID", 7133092873)
+BOOTSTRAP_ADMINS = _env_int_list("BOOTSTRAP_ADMINS", [626387429])
+BOOTSTRAP_OPERATORS = _env_int_list("BOOTSTRAP_OPERATORS", [])
 
-WITHDRAW_CHANNEL_ID = -1003785698154
-LOG_CHANNEL_ID = 0
-MIN_WITHDRAW = 10.0
-DEFAULT_HOLD_MINUTES = 15
-DEFAULT_TREASURY_BALANCE = 0.0
+WITHDRAW_CHANNEL_ID = _env_int("WITHDRAW_CHANNEL_ID", -1003785698154)
+LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 0)
+MIN_WITHDRAW = _env_float("MIN_WITHDRAW", 10.0)
+DEFAULT_HOLD_MINUTES = _env_int("DEFAULT_HOLD_MINUTES", 15)
+DEFAULT_TREASURY_BALANCE = _env_float("DEFAULT_TREASURY_BALANCE", 0.0)
 
 # Crypto Bot / Crypto Pay API
-CRYPTO_PAY_TOKEN = "561528:AALC6ucd7Ge10ZgaYiPhpITrc7nRUQhBr1N"  # configured
-CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
-CRYPTO_PAY_ASSET = "USDT"
-CRYPTO_PAY_PIN_CHECK_TO_USER = False  # True -> check pinned to telegram user
+CRYPTO_PAY_TOKEN = _env_str("CRYPTO_PAY_TOKEN")
+CRYPTO_PAY_BASE_URL = _env_str("CRYPTO_PAY_BASE_URL", "https://pay.crypt.bot/api")
+CRYPTO_PAY_ASSET = _env_str("CRYPTO_PAY_ASSET", "USDT")
+CRYPTO_PAY_PIN_CHECK_TO_USER = _env_bool("CRYPTO_PAY_PIN_CHECK_TO_USER", False)  # True -> check pinned to telegram user
 
 OPERATORS = {
     "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
@@ -7545,8 +7593,8 @@ async def track_any_message(message: Message):
 
 async def main():
     global LIVE_DP, PRIMARY_BOT
-    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("Укажи BOT_TOKEN прямо в bot.py")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Set it in Railway Variables.")
 
     db.recover_after_restart()
     primary_bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
